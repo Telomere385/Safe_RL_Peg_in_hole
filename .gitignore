@@ -1,0 +1,36 @@
+# Training outputs
+results/
+logs/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Model weights / checkpoints
+*.pt
+*.pkl
+*.pth
+
+# Large asset files (store separately or use Git LFS)
+*.usd
+*.usda
+*.usdc
+*.usdz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+name: safe_rl
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch==2.7.0
+    - numpy==1.26.0
+    - mushroom-rl==2.0.0rc1
+    - pyyaml
+    - tensorboard
+    # Isaac Lab is installed separately via isaaclab.sh — not listed here.
+    # See: https://isaac-sim.github.io/IsaacLab/main/source/setup/installation
