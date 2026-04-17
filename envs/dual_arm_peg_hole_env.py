@@ -134,11 +134,8 @@ class DualArmPegHoleEnvCfg(DirectRLEnvCfg):
     rew_weight_approach: float = 5.0     # 接近指数奖励峰值: +w * exp(-dist/scale)
     approach_scale: float = 0.3          # 指数衰减尺度 (m); dist=scale 时 bonus≈w/e
     rew_weight_joint_reg: float = 0.005  # 关节偏离默认位置的惩罚 (轻微正则)
-    rew_weight_height: float = 0.0       # EE 低于底座高度的惩罚 (禁用)
-    rew_weight_facing: float = 0.0       # EE 朝向对齐奖励 (暂时禁用)
     rew_weight_joint_limit: float = 1.0  # 接近关节极限的惩罚
     joint_limit_margin_frac: float = 0.95  # 关节限位惩罚触发阈值 (限位的百分比)
-    robot_base_height: float = 0.83      # 机器人底座高度
 
     # ── absorbing state (碰撞) 配置 ──
     # 碰撞检测力阈值 (N): 过低会被仿真初始化噪声误触发
@@ -242,24 +239,6 @@ class DualArmPegHoleEnv(DirectRLEnv):
         self.robot.set_joint_position_target(self._gripper_target)
 
     # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _quat_rotate_vec(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
-        """用四元数(wxyz)旋转向量. quat: (N,4), vec: (3,) → (N,3)."""
-        w, x, y, z = quat[:, 0:1], quat[:, 1:2], quat[:, 2:3], quat[:, 3:4]
-        # vec broadcast to (N, 3)
-        vx, vy, vz = vec[0], vec[1], vec[2]
-        # quaternion rotation: v' = q * v * q^-1
-        tx = 2.0 * (y * vz - z * vy)
-        ty = 2.0 * (z * vx - x * vz)
-        tz = 2.0 * (x * vy - y * vx)
-        rx = vx + w * tx + (y * tz - z * ty)
-        ry = vy + w * ty + (z * tx - x * tz)
-        rz = vz + w * tz + (x * ty - y * tx)
-        return torch.cat([rx, ry, rz], dim=-1)
-
-    # ------------------------------------------------------------------
     # Collision detection
     # ------------------------------------------------------------------
     def _check_collision(self) -> torch.Tensor:
@@ -323,27 +302,7 @@ class DualArmPegHoleEnv(DirectRLEnv):
         joint_pos = self.robot.data.joint_pos[:, self._arm_joint_ids]
         joint_deviation = torch.sum((joint_pos - self._default_arm_pos) ** 2, dim=-1)
 
-        # 3) EE 高度惩罚
-        base_z = self.scene.env_origins[:, 2] + self.cfg.robot_base_height
-        left_below = torch.clamp(base_z - left_ee_pos[:, 2], min=0.0)
-        right_below = torch.clamp(base_z - right_ee_pos[:, 2], min=0.0)
-        height_penalty = left_below + right_below
-
-        # 4) EE 朝向对齐 (权重为 0 时跳过计算)
-        if self.cfg.rew_weight_facing > 0.0:
-            left_ee_quat = self.robot.data.body_quat_w[:, self._left_ee_idx]
-            right_ee_quat = self.robot.data.body_quat_w[:, self._right_ee_idx]
-            left_z = self._quat_rotate_vec(left_ee_quat, torch.tensor([0., 0., 1.], device=self.device))
-            right_z = self._quat_rotate_vec(right_ee_quat, torch.tensor([0., 0., 1.], device=self.device))
-            l2r = right_ee_pos - left_ee_pos
-            l2r_norm = l2r / (torch.norm(l2r, dim=-1, keepdim=True) + 1e-6)
-            align_left = torch.sum(left_z * l2r_norm, dim=-1)
-            align_right = torch.sum(right_z * (-l2r_norm), dim=-1)
-            facing_reward = align_left + align_right
-        else:
-            facing_reward = torch.zeros(self.num_envs, device=self.device)
-
-        # 5) 关节接近极限的惩罚 (只在真正接近时触发)
+        # 3) 关节接近极限的惩罚 (只在真正接近时触发)
         margin = self._joint_upper * self.cfg.joint_limit_margin_frac
         over_margin = torch.clamp(torch.abs(joint_pos) - margin, min=0.0)
         joint_limit_penalty = torch.sum(over_margin ** 2, dim=-1)
@@ -352,8 +311,6 @@ class DualArmPegHoleEnv(DirectRLEnv):
             -self.cfg.rew_weight_mutual * dist_mutual
             + self.cfg.rew_weight_approach * approach_bonus
             - self.cfg.rew_weight_joint_reg * joint_deviation
-            - self.cfg.rew_weight_height * height_penalty
-            + self.cfg.rew_weight_facing * facing_reward
             - self.cfg.rew_weight_joint_limit * joint_limit_penalty
         )
 
@@ -373,8 +330,6 @@ class DualArmPegHoleEnv(DirectRLEnv):
             "ee_distance": dist_mutual,
             "approach_bonus": approach_bonus,
             "joint_deviation": joint_deviation,
-            "height_penalty": height_penalty,
-            "facing_reward": facing_reward,
             "joint_limit_penalty": joint_limit_penalty,
             "collision": collision.float(),
             "in_absorbing": self._in_absorbing.float(),
