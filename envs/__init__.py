@@ -1,3 +1,3 @@
-from .mushroom_wrapper import DualArmPegHoleMushroom
+from .dual_arm_peg_hole_env import DualArmPegHoleEnv
 
-__all__ = ["DualArmPegHoleMushroom"]
+__all__ = ["DualArmPegHoleEnv"]

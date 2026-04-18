@@ -1,237 +1,183 @@
-"""SAC 训练脚本 — 双臂末端靠近任务 (pipeline 验证).
+"""SAC 训练脚本 — 双臂末端靠近 (mushroom-rl + VectorCore).
 
-运行 (headless):
-    cd ~/IsaacLab && ./isaaclab.sh -p ~/bimanual_peghole/scripts/train_sac.py --headless
-
-带可视化:
-    cd ~/IsaacLab && ./isaaclab.sh -p ~/bimanual_peghole/scripts/train_sac.py
+运行:
+    conda activate safe_rl
+    python scripts/train_sac.py                 # 单 env, 无头, wandb 开启
+    python scripts/train_sac.py --num_envs 16   # 16 并行 env
+    python scripts/train_sac.py --render        # 打开 IsaacSim 窗口
+    python scripts/train_sac.py --no_wandb      # 关闭 wandb 日志
 """
 
-# ── IsaacLab 启动 (必须在所有 isaaclab import 之前) ──
 import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--headless", action="store_true", default=False)
-parser.add_argument("--num_envs", type=int, default=1)
-parser.add_argument("--seed", type=int, default=42)
-args, _ = parser.parse_known_args()
-
-from isaaclab.app import AppLauncher
-
-app_launcher = AppLauncher(headless=args.headless)
-simulation_app = app_launcher.app
-
-# ── 标准库 ──
 import sys
 from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-# ── 项目路径 ──
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# ── MushroomRL 2.0 ──
-from mushroom_rl.algorithms.actor_critic import SAC
-from mushroom_rl.core import Core
 
-# ── 自定义环境 wrapper ──
-from envs.mushroom_wrapper import DualArmPegHoleMushroom
-from envs.dual_arm_peg_hole_env import DualArmPegHoleEnvCfg
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--num_envs", type=int, default=1)
+    p.add_argument("--render", action="store_true", help="打开 IsaacSim 窗口")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--n_epochs", type=int, default=100)
+    p.add_argument("--n_steps_per_epoch", type=int, default=1000)
+    p.add_argument("--n_steps_per_fit", type=int, default=64,
+                   help="每次 fit 的 env-step 数. 必须 >= num_envs (mushroom "
+                        "vectorized dataset 要求 ceil(n_steps_per_fit/num_envs) >= 1)")
+    p.add_argument("--n_eval_episodes", type=int, default=3)
+    p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--no_wandb", action="store_true", help="关闭 wandb 日志")
+    return p.parse_args()
 
-# ---------------------------------------------------------------------------
-# 超参数
-# ---------------------------------------------------------------------------
-N_EPOCHS = 100
-N_STEPS_PER_EPOCH = 1000       # 10 episodes worth (horizon=100)
-N_STEPS_PER_FIT = 5            # every 5 env steps do one gradient update
-N_EVAL_EPISODES = 3
-BATCH_SIZE = 256
-INITIAL_REPLAY_SIZE = 1000     # 10 episodes of random exploration
-MAX_REPLAY_SIZE = 100000
-WARMUP_TRANSITIONS = 1000
-TAU = 0.005
-LR_ALPHA = 3e-4
-LR_ACTOR = 3e-4
-LR_CRITIC = 3e-4
+
+# --------------------------------------------------------------------------
+# 网络
+# --------------------------------------------------------------------------
 N_FEATURES = 256
-GAMMA = 0.99
 
 
-# ---------------------------------------------------------------------------
-# 网络定义 — MushroomRL 2.0 要求 network 是一个类,
-# 构造签名: __init__(self, input_shape, output_shape, **params)
-# ---------------------------------------------------------------------------
 class ActorNetwork(nn.Module):
-    """Actor 网络 (mu 或 sigma 各用一个)."""
-
-    def __init__(self, input_shape, output_shape, n_features=N_FEATURES, **kwargs):
+    def __init__(self, input_shape, output_shape, n_features=N_FEATURES, **_):
         super().__init__()
-        n_input = input_shape[0]
-        n_output = output_shape[0]
-        self._h1 = nn.Linear(n_input, n_features)
+        self._h1 = nn.Linear(input_shape[0], n_features)
         self._h2 = nn.Linear(n_features, n_features)
-        self._out = nn.Linear(n_features, n_output)
-        nn.init.xavier_uniform_(self._h1.weight)
-        nn.init.xavier_uniform_(self._h2.weight)
-        nn.init.xavier_uniform_(self._out.weight)
+        self._out = nn.Linear(n_features, output_shape[0])
+        for l in (self._h1, self._h2, self._out):
+            nn.init.xavier_uniform_(l.weight)
 
-    def forward(self, x, **kwargs):
-        x = x.float()
-        h = F.relu(self._h1(x))
+    def forward(self, x, **_):
+        h = F.relu(self._h1(x.float()))
         h = F.relu(self._h2(h))
         return self._out(h)
 
 
 class CriticNetwork(nn.Module):
-    """Critic 网络 Q(s, a).
-
-    MushroomRL 2.0 的 TorchApproximator 会将 (state, action) 作为
-    两个独立的位置参数传入 forward, 所以 input_shape 只需要是 (obs_dim,).
-    """
-
-    def __init__(self, input_shape, output_shape, n_features=N_FEATURES,
-                 action_dim=None, **kwargs):
+    def __init__(self, input_shape, output_shape, n_features=N_FEATURES, action_dim=14, **_):
         super().__init__()
-        n_input = input_shape[0]
-        if action_dim is None:
-            action_dim = 14  # fallback
-        n_output = output_shape[0]
-        self._h1 = nn.Linear(n_input + action_dim, n_features)
+        self._h1 = nn.Linear(input_shape[0] + action_dim, n_features)
         self._h2 = nn.Linear(n_features, n_features)
-        self._out = nn.Linear(n_features, n_output)
-        nn.init.xavier_uniform_(self._h1.weight)
-        nn.init.xavier_uniform_(self._h2.weight)
-        nn.init.xavier_uniform_(self._out.weight)
+        self._out = nn.Linear(n_features, output_shape[0])
+        for l in (self._h1, self._h2, self._out):
+            nn.init.xavier_uniform_(l.weight)
 
-    def forward(self, state, action, **kwargs):
-        state = state.float()
-        action = action.float()
-        x = torch.cat([state, action], dim=-1)
-        h = F.relu(self._h1(x))
+    def forward(self, state, action, **_):
+        h = F.relu(self._h1(torch.cat([state.float(), action.float()], dim=-1)))
         h = F.relu(self._h2(h))
         return self._out(h).squeeze(-1)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
-    print("=" * 60)
-    print("SAC Training — 双臂末端靠近任务 (Pipeline 验证)")
-    print("=" * 60)
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-    # ── 1. 创建环境 ──
-    env_cfg = DualArmPegHoleEnvCfg()
-    env_cfg.scene.num_envs = args.num_envs
-    env_cfg.seed = args.seed
+    # ── 创建环境 (内部启动 IsaacSim) ──
+    from envs import DualArmPegHoleEnv
 
-    mdp = DualArmPegHoleMushroom(cfg=env_cfg, gamma=GAMMA)
-
-    obs_dim = mdp.info.observation_space.shape[0]  # 37
-    act_dim = mdp.info.action_space.shape[0]        # 14
-
-    print(f"  Observation dim: {obs_dim}")
-    print(f"  Action dim:      {act_dim}")
-    print(f"  Horizon:         {mdp.info.horizon}")
-    print(f"  Gamma:           {mdp.info.gamma}")
-
-    # ── 2. 构建 SAC agent ──
-    actor_mu_params = dict(
-        network=ActorNetwork,
-        input_shape=(obs_dim,),
-        output_shape=(act_dim,),
-        n_features=N_FEATURES,
+    assert args.n_steps_per_fit >= args.num_envs, (
+        f"n_steps_per_fit ({args.n_steps_per_fit}) 必须 >= num_envs ({args.num_envs})"
     )
 
-    actor_sigma_params = dict(
-        network=ActorNetwork,
-        input_shape=(obs_dim,),
-        output_shape=(act_dim,),
-        n_features=N_FEATURES,
-    )
+    mdp = DualArmPegHoleEnv(num_envs=args.num_envs, headless=not args.render)
+    mdp.seed(args.seed)
 
-    actor_optimizer = {
-        "class": optim.Adam,
-        "params": {"lr": LR_ACTOR},
-    }
+    # ── mushroom_rl 模块在 IsaacSim 启动后导入 (避免 carb 冲突) ──
+    from mushroom_rl.algorithms.actor_critic import SAC
+    from mushroom_rl.core import VectorCore, Logger
 
-    critic_params = dict(
-        network=CriticNetwork,
-        input_shape=(obs_dim,),
-        output_shape=(1,),
-        n_features=N_FEATURES,
-        action_dim=act_dim,
-        optimizer={
-            "class": optim.Adam,
-            "params": {"lr": LR_CRITIC},
-        },
-        loss=F.mse_loss,
-    )
+    obs_dim = mdp.info.observation_space.shape[0]
+    act_dim = mdp.info.action_space.shape[0]
+
+    actor_params = dict(network=ActorNetwork, input_shape=(obs_dim,),
+                        output_shape=(act_dim,), n_features=N_FEATURES)
+    actor_optimizer = {"class": optim.Adam, "params": {"lr": 3e-4}}
+    critic_params = dict(network=CriticNetwork, input_shape=(obs_dim,),
+                         output_shape=(1,), n_features=N_FEATURES, action_dim=act_dim,
+                         optimizer={"class": optim.Adam, "params": {"lr": 3e-4}},
+                         loss=F.mse_loss)
 
     agent = SAC(
         mdp_info=mdp.info,
-        actor_mu_params=actor_mu_params,
-        actor_sigma_params=actor_sigma_params,
+        actor_mu_params=actor_params,
+        actor_sigma_params=actor_params,
         actor_optimizer=actor_optimizer,
         critic_params=critic_params,
-        batch_size=BATCH_SIZE,
-        initial_replay_size=INITIAL_REPLAY_SIZE,
-        max_replay_size=MAX_REPLAY_SIZE,
-        warmup_transitions=WARMUP_TRANSITIONS,
-        tau=TAU,
-        lr_alpha=LR_ALPHA,
+        batch_size=256,
+        initial_replay_size=1000,
+        max_replay_size=100_000,
+        warmup_transitions=1000,
+        tau=0.005,
+        lr_alpha=3e-4,
     )
 
-    # ── 3. 创建训练 Core ──
-    core = Core(agent, mdp)
+    core = VectorCore(agent, mdp)
 
-    # ── 4. 初始 replay buffer 填充 ──
-    print(f"\n填充 replay buffer ({INITIAL_REPLAY_SIZE} steps)...")
-    core.learn(n_steps=INITIAL_REPLAY_SIZE, n_steps_per_fit=INITIAL_REPLAY_SIZE)
-    print("  Replay buffer 填充完成.")
-
-    # ── 5. 训练循环 ──
-    print(f"\n开始训练: {N_EPOCHS} epochs x {N_STEPS_PER_EPOCH} steps")
-    print("-" * 60)
-
-    best_J = -np.inf
     results_dir = PROJECT_ROOT / "results"
     results_dir.mkdir(exist_ok=True)
+    logger = Logger("SAC", results_dir=str(results_dir))
+    logger.strong_line()
+    logger.info(f"obs_dim={obs_dim}  act_dim={act_dim}  horizon={mdp.info.horizon}")
 
-    for epoch in range(N_EPOCHS):
-        # 训练
-        core.learn(
-            n_steps=N_STEPS_PER_EPOCH,
-            n_steps_per_fit=N_STEPS_PER_FIT,
-            quiet=True,
+    # ── wandb 初始化 (可选) ──
+    wandb_run = None
+    if not args.no_wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={**vars(args), "algo": "SAC", "n_features": N_FEATURES,
+                    "obs_dim": obs_dim, "act_dim": act_dim,
+                    "horizon": mdp.info.horizon, "gamma": mdp.info.gamma},
+            dir=str(results_dir),
         )
+        logger.info(f"wandb run: {wandb_run.url}")
 
-        # 评估
-        dataset = core.evaluate(n_episodes=N_EVAL_EPISODES, quiet=True)
-        J = dataset.discounted_return.mean()
-        R = dataset.undiscounted_return.mean()
+    # ── 1. 初始 replay 填充 ──
+    logger.info("填充 replay buffer ...")
+    core.learn(n_steps=1000, n_steps_per_fit=1000)
 
-        # 保存最优
+    # ── 2. 训练主循环 ──
+    best_J = -np.inf
+    total_env_steps = 1000 * args.num_envs  # 初始填充后累计的 env-step
+    for epoch in range(args.n_epochs):
+        core.learn(n_steps=args.n_steps_per_epoch,
+                   n_steps_per_fit=args.n_steps_per_fit, quiet=True)
+        total_env_steps += args.n_steps_per_epoch * args.num_envs
+
+        dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
+        J = torch.mean(dataset.discounted_return).item()
+        R = torch.mean(dataset.undiscounted_return).item()
+        ep_len = len(dataset) / max(args.n_eval_episodes, 1)
+
         if J > best_J:
             best_J = J
             agent.save(str(results_dir / "best_agent.msh"))
 
-        print(f"  Epoch {epoch + 1:3d}/{N_EPOCHS} | "
-              f"J(gamma)={J:8.3f} | R={R:8.3f} | best_J={best_J:8.3f}")
+        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J)
+        if wandb_run is not None:
+            wandb_run.log({
+                "epoch": epoch + 1,
+                "env_steps": total_env_steps,
+                "J": J, "R": R, "best_J": best_J,
+                "eval_ep_len": ep_len,
+                "alpha": float(agent._alpha.item()) if hasattr(agent, "_alpha") else None,
+            }, step=epoch + 1)
 
-    # ── 6. 结束 ──
-    print("\n" + "=" * 60)
-    print(f"训练完成! Best J(gamma) = {best_J:.3f}")
-    print(f"模型保存于: {results_dir / 'best_agent.msh'}")
-    print("=" * 60)
-
-    mdp.close()
+    logger.info(f"训练完成. best J = {best_J:.3f}")
+    if wandb_run is not None:
+        wandb_run.summary["best_J"] = best_J
+        wandb_run.finish()
+    mdp.stop()
 
 
 if __name__ == "__main__":
     main()
-    simulation_app.close()

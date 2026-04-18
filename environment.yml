@@ -9,7 +9,5 @@ dependencies:
     - torch==2.7.0
     - numpy==1.26.0
     - mushroom-rl==2.0.0rc1
-    - pyyaml
-    - tensorboard
-    # Isaac Lab is installed separately via isaaclab.sh — not listed here.
-    # See: https://isaac-sim.github.io/IsaacLab/main/source/setup/installation
+    - wandb
+    # IsaacSim 由 mushroom-rl 2.0 的 IsaacSim 环境类托管 (pip install isaacsim 即可)
