@@ -78,9 +78,9 @@ def main():
         env_kwargs["rew_pose"] = args.rew_pose
     if args.sanity:
         env_kwargs.update(
-            target_travel_fraction=0.0,   # 目标 = default EE, 原地不动就算赢
+            target_travel_fraction=0.0,   # 目标 = default 6-DoF EE pose
             initial_joint_noise=0.05,     # ~3° / joint, EE 偏 ~2-3cm
-            success_pos_threshold=0.1,    # 放宽到 10cm (起始就在阈值内)
+            success_pos_threshold=0.1,    # 放宽到 10cm, sanity reset 应留在 success 内
         )
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -125,6 +125,22 @@ def main():
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
     logger.info(f"obs_dim={obs_dim}  act_dim={act_dim}  horizon={mdp.info.horizon}")
+
+    if args.sanity:
+        mask = torch.ones(args.num_envs, dtype=torch.bool, device=mdp._device)
+        obs, _ = mdp.reset_all(mask)
+        left_pos_err, right_pos_err, pose_err, success_mask = mdp._compute_task_errors(obs)
+        success_rate = float(success_mask.float().mean())
+        logger.info("sanity reset: "
+                    f"success_rate={success_rate:.3f}  "
+                    f"left_pos_err_mean={float(left_pos_err.mean()):.4f}m  "
+                    f"right_pos_err_mean={float(right_pos_err.mean()):.4f}m  "
+                    f"pose_err_mean={float(pose_err.mean()):.4f}")
+        if success_rate < 0.95:
+            raise RuntimeError(
+                "--sanity expects reset states to already satisfy the success condition. "
+                f"Observed success_rate={success_rate:.3f}; check sanity env settings."
+            )
 
     wandb_run = None
     if not args.no_wandb:

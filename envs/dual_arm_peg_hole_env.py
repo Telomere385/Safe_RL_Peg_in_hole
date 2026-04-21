@@ -239,18 +239,25 @@ class DualArmPegHoleEnv(IsaacSim):
         self._left_target = left_default + f * (center - left_default)
         self._right_target = right_default + f * (center - right_default)
 
-        # 目标 z 轴: 左 EE z 指向 T_R, 右 EE z 指向 T_L (夹爪对开)
-        z_L_target = self._right_target - self._left_target
-        z_L_target = z_L_target / torch.norm(z_L_target)
-        z_R_target = -z_L_target
+        # f=0 应退化成 "目标 = default 6-DoF pose". 若仍强制 z 轴彼此相对，
+        # 会出现位置不动但姿态目标突变的非连续行为，--sanity 会被错误地变成
+        # "位置在阈值内、姿态永远不在阈值内" 的假 trivial task。
+        if abs(float(f)) < 1e-8:
+            self._left_target_rot = left_rot_default
+            self._right_target_rot = right_rot_default
+        else:
+            # 目标 z 轴: 左 EE z 指向 T_R, 右 EE z 指向 T_L (夹爪对开)
+            z_L_target = self._right_target - self._left_target
+            z_L_target = z_L_target / torch.norm(z_L_target)
+            z_R_target = -z_L_target
 
-        # 最小弧旋转 · default quat → target quat (保持其余 2 DoF 接近 default)
-        z_L_default = self._quat_rotate_z(left_rot_default)
-        z_R_default = self._quat_rotate_z(right_rot_default)
-        delta_L = self._quat_shortest_arc(z_L_default, z_L_target)
-        delta_R = self._quat_shortest_arc(z_R_default, z_R_target)
-        self._left_target_rot = self._quat_multiply(delta_L, left_rot_default)
-        self._right_target_rot = self._quat_multiply(delta_R, right_rot_default)
+            # 最小弧旋转 · default quat → target quat (保持其余 2 DoF 接近 default)
+            z_L_default = self._quat_rotate_z(left_rot_default)
+            z_R_default = self._quat_rotate_z(right_rot_default)
+            delta_L = self._quat_shortest_arc(z_L_default, z_L_target)
+            delta_R = self._quat_shortest_arc(z_R_default, z_R_target)
+            self._left_target_rot = self._quat_multiply(delta_L, left_rot_default)
+            self._right_target_rot = self._quat_multiply(delta_R, right_rot_default)
         self._left_target_rot = self._left_target_rot / torch.norm(self._left_target_rot)
         self._right_target_rot = self._right_target_rot / torch.norm(self._right_target_rot)
 
