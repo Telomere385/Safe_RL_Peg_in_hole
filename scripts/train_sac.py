@@ -6,6 +6,7 @@ phase 1: 纯位置 reaching, 14 维 joint velocity 动作, 40 维 obs.
     conda activate safe_rl
     python scripts/train_sac.py
     python scripts/train_sac.py --target_travel_fraction 0.25 --initial_joint_noise 0.05
+    python scripts/train_sac.py --left_target -0.62 -0.55 0.69 --right_target -0.62 0.38 0.74
     python scripts/train_sac.py --render
     python scripts/train_sac.py --no_wandb
 
@@ -13,7 +14,6 @@ phase 1: 纯位置 reaching, 14 维 joint velocity 动作, 40 维 obs.
 """
 
 import argparse
-from contextlib import contextmanager
 import math
 import sys
 from pathlib import Path
@@ -27,9 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from networks import ActorNetwork, CriticNetwork
-
-DEFAULT_LEFT_CHEST_TARGET = (-0.6176, -0.75, 0.7391)
-DEFAULT_RIGHT_CHEST_TARGET = (-0.6176, 0.73, 0.7391)
+from scripts._eval_utils import compute_hold_metrics, deterministic_policy
 
 
 INITIAL_REPLAY_SIZE = 10_000
@@ -61,6 +59,12 @@ def parse_args():
     p.add_argument("--target_travel_fraction", type=float, default=None,
                    help="显式切回 fraction 目标模式时使用的内收比例 f. "
                         "若不传, 默认使用胸前固定目标点")
+    p.add_argument("--left_target", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="显式指定左臂固定目标点 (world/env-local frame)")
+    p.add_argument("--right_target", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="显式指定右臂固定目标点 (world/env-local frame)")
     p.add_argument("--initial_joint_noise", type=float, default=None,
                    help="覆盖 env 的 reset 关节噪声")
     p.add_argument("--success_pos_threshold", type=float, default=None,
@@ -74,29 +78,6 @@ def parse_args():
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
     return p.parse_args()
-
-
-@contextmanager
-def deterministic_policy(agent):
-    policy = agent.policy
-    original_draw_action = policy.draw_action
-
-    def draw_action(state, internal_state=None):
-        with torch.no_grad():
-            mu = policy._mu_approximator.predict(state)
-            action = torch.tanh(mu) * policy._delta_a + policy._central_a
-        return action.detach(), None
-
-    policy.draw_action = draw_action
-    try:
-        yield
-    finally:
-        policy.draw_action = original_draw_action
-
-
-def evaluate_deterministic(core, agent, n_episodes, quiet):
-    with deterministic_policy(agent):
-        return core.evaluate(n_episodes=n_episodes, quiet=quiet)
 
 
 def main():
@@ -135,9 +116,23 @@ def main():
             "epoch 末尾丢弃未 fit 的残余 transition"
         )
 
-    from envs import DualArmPegHoleEnv
+    from envs import (
+        DEFAULT_LEFT_CHEST_TARGET,
+        DEFAULT_RIGHT_CHEST_TARGET,
+        DualArmPegHoleEnv,
+    )
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
-    if args.target_travel_fraction is None:
+    if (args.left_target is None) != (args.right_target is None):
+        raise ValueError("--left_target 和 --right_target 必须同时提供")
+    if args.left_target is not None and args.target_travel_fraction is not None:
+        raise ValueError("显式 fixed targets 与 --target_travel_fraction 不能同时使用")
+
+    if args.left_target is not None:
+        env_kwargs.update(
+            left_target=tuple(args.left_target),
+            right_target=tuple(args.right_target),
+        )
+    elif args.target_travel_fraction is None:
         env_kwargs.update(
             left_target=DEFAULT_LEFT_CHEST_TARGET,
             right_target=DEFAULT_RIGHT_CHEST_TARGET,
@@ -267,47 +262,12 @@ def main():
         # 在 evaluate 之前快照, 只计训练期间的碰撞 (eval 碰撞不算本 epoch)
         absorb_epoch = mdp._absorb_count - absorb_prev
 
-        dataset = evaluate_deterministic(core, agent, args.n_eval_episodes, quiet=True)
+        with deterministic_policy(agent):
+            dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
         J = torch.mean(dataset.discounted_return).item()
         R = torch.mean(dataset.undiscounted_return).item()
         ep_len = len(dataset) / args.n_eval_episodes
-        _, _, _, next_state, _, last = dataset.parse(to="torch")
-
-        # per-step task error & in-threshold mask (整段 trajectory)
-        step_left_err, step_right_err, step_in_thresh = mdp._compute_task_errors(next_state)
-        last_np = last.cpu().numpy().astype(bool)
-        in_thresh_np = step_in_thresh.cpu().numpy().astype(bool)
-
-        # 按 last flag 分段, 统计每个 episode 最长连续 in-threshold 长度
-        # "hold success" = 出现长度 >= hold_success_steps 的连续 True 段
-        end_indices = np.flatnonzero(last_np)
-        ep_max_holds = []
-        ep_in_thresh_rates = []
-        ep_final_in_thresh = []
-        start = 0
-        for end in end_indices:
-            ep = in_thresh_np[start:end + 1]
-            # 最长连续 True
-            max_run = 0
-            cur = 0
-            for flag in ep:
-                cur = cur + 1 if flag else 0
-                if cur > max_run:
-                    max_run = cur
-            ep_max_holds.append(max_run)
-            ep_in_thresh_rates.append(float(ep.mean()) if len(ep) else 0.0)
-            ep_final_in_thresh.append(bool(ep[-1]) if len(ep) else False)
-            start = end + 1
-
-        N_hold = args.hold_success_steps
-        hold_flags = np.asarray([mh >= N_hold for mh in ep_max_holds], dtype=bool)
-        eval_success_rate = float(hold_flags.mean()) if len(hold_flags) else 0.0
-        eval_max_hold_mean = float(np.mean(ep_max_holds)) if ep_max_holds else 0.0
-        eval_in_thresh_rate = float(np.mean(ep_in_thresh_rates)) if ep_in_thresh_rates else 0.0
-        eval_final_in_thresh_rate = (float(np.mean(ep_final_in_thresh))
-                                     if ep_final_in_thresh else 0.0)
-        eval_left_pos_err_mean = float(step_left_err.mean())
-        eval_right_pos_err_mean = float(step_right_err.mean())
+        m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
 
         if J > best_J:
             best_J = J
@@ -319,22 +279,23 @@ def main():
         logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J,
                           absorb_epoch=absorb_epoch)
         logger.info("eval stats: "
-                    f"hold_success_rate={eval_success_rate:.3f} (>= {N_hold} consecutive steps)  "
-                    f"max_hold_mean={eval_max_hold_mean:.1f}  "
-                    f"in_thresh_rate={eval_in_thresh_rate:.3f}  "
-                    f"final_in_thresh_rate={eval_final_in_thresh_rate:.3f}  "
-                    f"left_err_mean={eval_left_pos_err_mean:.4f}m  "
-                    f"right_err_mean={eval_right_pos_err_mean:.4f}m")
+                    f"hold_success_rate={m['hold_success_rate']:.3f} "
+                    f"(>= {args.hold_success_steps} consecutive steps)  "
+                    f"max_hold_mean={m['max_hold_mean']:.1f}  "
+                    f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
+                    f"final_in_thresh_rate={m['final_in_thresh_rate']:.3f}  "
+                    f"left_err_mean={m['left_pos_err_mean']:.4f}m  "
+                    f"right_err_mean={m['right_pos_err_mean']:.4f}m")
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
                 "J": J, "R": R, "best_J": best_J, "eval_ep_len": ep_len,
-                "eval_success_rate": eval_success_rate,
-                "eval_max_hold_mean": eval_max_hold_mean,
-                "eval_in_thresh_rate": eval_in_thresh_rate,
-                "eval_final_in_thresh_rate": eval_final_in_thresh_rate,
-                "eval_left_pos_err_mean": eval_left_pos_err_mean,
-                "eval_right_pos_err_mean": eval_right_pos_err_mean,
+                "eval_success_rate": m["hold_success_rate"],
+                "eval_max_hold_mean": m["max_hold_mean"],
+                "eval_in_thresh_rate": m["in_thresh_rate"],
+                "eval_final_in_thresh_rate": m["final_in_thresh_rate"],
+                "eval_left_pos_err_mean": m["left_pos_err_mean"],
+                "eval_right_pos_err_mean": m["right_pos_err_mean"],
                 "alpha": agent._alpha.item(),
                 "absorb_per_epoch": absorb_epoch,
             }, step=epoch + 1)

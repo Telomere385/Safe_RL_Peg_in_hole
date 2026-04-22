@@ -25,7 +25,7 @@ class ActorNetwork(nn.Module):
 
 
 class CriticNetwork(nn.Module):
-    def __init__(self, input_shape, output_shape, n_features=256, action_dim=8, **_):
+    def __init__(self, input_shape, output_shape, action_dim, n_features=256, **_):
         super().__init__()
         self._h1 = nn.Linear(input_shape[0] + action_dim, n_features)
         self._h2 = nn.Linear(n_features, n_features)

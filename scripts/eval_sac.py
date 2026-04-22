@@ -5,21 +5,19 @@
     python scripts/eval_sac.py              # 带渲染窗口, 默认验证胸前固定目标
     python scripts/eval_sac.py --headless   # 无窗口验证
     python scripts/eval_sac.py --target_travel_fraction 0.1   # 显式切回 fraction 模式
+    python scripts/eval_sac.py --left_target -0.62 -0.55 0.69 --right_target -0.62 0.38 0.74
 """
 
 import argparse
-from contextlib import contextmanager
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DEFAULT_LEFT_CHEST_TARGET = (-0.6176, -0.75, 0.7391)
-DEFAULT_RIGHT_CHEST_TARGET = (-0.6176, 0.73, 0.7391)
+from scripts._eval_utils import compute_hold_metrics, deterministic_policy
 
 
 def parse_args():
@@ -33,6 +31,12 @@ def parse_args():
     p.add_argument("--target_travel_fraction", type=float, default=None,
                    help="显式切回 fraction 目标模式时使用的内收比例 f. "
                         "若不传, 默认使用胸前固定目标点")
+    p.add_argument("--left_target", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="显式指定左臂固定目标点 (world/env-local frame)")
+    p.add_argument("--right_target", type=float, nargs=3, default=None,
+                   metavar=("X", "Y", "Z"),
+                   help="显式指定右臂固定目标点 (world/env-local frame)")
     p.add_argument("--initial_joint_noise", type=float, default=None,
                    help="覆盖 env 默认 reset 关节噪声")
     p.add_argument("--success_pos_threshold", type=float, default=None,
@@ -44,29 +48,27 @@ def parse_args():
     return p.parse_args()
 
 
-@contextmanager
-def deterministic_policy(agent):
-    policy = agent.policy
-    original_draw_action = policy.draw_action
-
-    def draw_action(state, internal_state=None):
-        with torch.no_grad():
-            mu = policy._mu_approximator.predict(state)
-            action = torch.tanh(mu) * policy._delta_a + policy._central_a
-        return action.detach(), None
-
-    policy.draw_action = draw_action
-    try:
-        yield
-    finally:
-        policy.draw_action = original_draw_action
-
-
 def main():
     args = parse_args()
 
+    if (args.left_target is None) != (args.right_target is None):
+        raise ValueError("--left_target 和 --right_target 必须同时提供")
+    if args.left_target is not None and args.target_travel_fraction is not None:
+        raise ValueError("显式 fixed targets 与 --target_travel_fraction 不能同时使用")
+
+    from envs import (
+        DEFAULT_LEFT_CHEST_TARGET,
+        DEFAULT_RIGHT_CHEST_TARGET,
+        DualArmPegHoleEnv,
+    )
+
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
-    if args.target_travel_fraction is None:
+    if args.left_target is not None:
+        env_kwargs.update(
+            left_target=tuple(args.left_target),
+            right_target=tuple(args.right_target),
+        )
+    elif args.target_travel_fraction is None:
         env_kwargs.update(
             left_target=DEFAULT_LEFT_CHEST_TARGET,
             right_target=DEFAULT_RIGHT_CHEST_TARGET,
@@ -79,7 +81,6 @@ def main():
             env_kwargs[key] = value
     print(f"[EVAL ENV] {env_kwargs}")
 
-    from envs import DualArmPegHoleEnv
     mdp = DualArmPegHoleEnv(**env_kwargs)
 
     from mushroom_rl.core import Agent, VectorCore
@@ -97,41 +98,15 @@ def main():
     R = torch.mean(dataset.undiscounted_return).item()
     print(f"J(γ)={J:.3f}  R={R:.3f}")
 
-    _, _, _, next_state, _, last = dataset.parse(to="torch")
-    left_err, right_err, in_thresh = mdp._compute_task_errors(next_state)
-    last_np = last.cpu().numpy().astype(bool)
-    in_thresh_np = in_thresh.cpu().numpy().astype(bool)
-
-    end_indices = np.flatnonzero(last_np)
-    ep_max_holds = []
-    ep_in_thresh_rates = []
-    ep_final_in_thresh = []
-    start = 0
-    for end in end_indices:
-        ep = in_thresh_np[start:end + 1]
-        max_run = 0
-        cur = 0
-        for flag in ep:
-            cur = cur + 1 if flag else 0
-            if cur > max_run:
-                max_run = cur
-        ep_max_holds.append(max_run)
-        ep_in_thresh_rates.append(float(ep.mean()) if len(ep) else 0.0)
-        ep_final_in_thresh.append(bool(ep[-1]) if len(ep) else False)
-        start = end + 1
-
-    hold_flags = np.asarray([mh >= args.hold_success_steps for mh in ep_max_holds], dtype=bool)
-    hold_success_rate = float(hold_flags.mean()) if len(hold_flags) else 0.0
-    max_hold_mean = float(np.mean(ep_max_holds)) if ep_max_holds else 0.0
-    in_thresh_rate = float(np.mean(ep_in_thresh_rates)) if ep_in_thresh_rates else 0.0
-    final_in_thresh_rate = float(np.mean(ep_final_in_thresh)) if ep_final_in_thresh else 0.0
+    m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
     print(
-        f"hold_success_rate={hold_success_rate:.3f} (>= {args.hold_success_steps} consecutive steps)  "
-        f"max_hold_mean={max_hold_mean:.1f}  "
-        f"in_thresh_rate={in_thresh_rate:.3f}  "
-        f"final_in_thresh_rate={final_in_thresh_rate:.3f}  "
-        f"left_err_mean={float(left_err.mean()):.4f}m  "
-        f"right_err_mean={float(right_err.mean()):.4f}m"
+        f"hold_success_rate={m['hold_success_rate']:.3f} "
+        f"(>= {args.hold_success_steps} consecutive steps)  "
+        f"max_hold_mean={m['max_hold_mean']:.1f}  "
+        f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
+        f"final_in_thresh_rate={m['final_in_thresh_rate']:.3f}  "
+        f"left_err_mean={m['left_pos_err_mean']:.4f}m  "
+        f"right_err_mean={m['right_pos_err_mean']:.4f}m"
     )
 
     mdp.stop()

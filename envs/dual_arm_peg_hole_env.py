@@ -23,9 +23,9 @@ Reward:
     + w_success * 1[||·||_L < pos_th ∧ ||·||_R < pos_th]
 
 Target 生成 (在 __init__ 末尾 eager-init 一次冻结, 固定在 world frame):
-    - 默认使用 curriculum 的浅层胸前固定目标点:
-      T_L = [-0.6176, -0.75, 0.7391]
-      T_R = [-0.6176,  0.73, 0.7391]
+    - 默认使用对称的前下方固定目标点:
+      T_L = [-0.80, -0.40, 0.62]
+      T_R = [-0.80,  0.40, 0.62]
     - 若未显式给 fixed target, 则回退到 fraction 模式:
       left_default, right_default = env-平均的 default EE 位置
       center = (left_default + right_default) / 2
@@ -64,8 +64,8 @@ RIGHT_EE_PATH = "/right_hande_robotiq_hande_link"
 LEFT_ARM_GROUP = LEFT_ARM_LINKS + [LEFT_EE_PATH]
 RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 
-DEFAULT_LEFT_CHEST_TARGET = (-0.6176, -0.75, 0.7391)
-DEFAULT_RIGHT_CHEST_TARGET = (-0.6176, 0.73, 0.7391)
+DEFAULT_LEFT_CHEST_TARGET = (-0.80, -0.40, 0.62)
+DEFAULT_RIGHT_CHEST_TARGET = (-0.80, 0.40, 0.62)
 
 
 class DualArmPegHoleEnv(IsaacSim):
@@ -209,10 +209,11 @@ class DualArmPegHoleEnv(IsaacSim):
 
     def _init_targets(self, left_ee, right_ee):
         """优先使用固定胸前目标; 否则从 env-平均 default EE 位置 + fraction 冻结目标."""
-        left_default = left_ee.mean(dim=0).detach().clone()
-        right_default = right_ee.mean(dim=0).detach().clone()
         if (self._fixed_left_target is None) != (self._fixed_right_target is None):
             raise ValueError("left_target 和 right_target 必须同时提供或同时为 None")
+
+        left_default = left_ee.mean(dim=0).detach().clone()
+        right_default = right_ee.mean(dim=0).detach().clone()
 
         if self._fixed_left_target is not None:
             self._left_target = torch.as_tensor(
@@ -221,7 +222,7 @@ class DualArmPegHoleEnv(IsaacSim):
             self._right_target = torch.as_tensor(
                 self._fixed_right_target, device=right_default.device, dtype=right_default.dtype
             ).clone()
-            print("[TARGETS] fixed chest-front targets\n"
+            print("[TARGETS] fixed symmetric front-low targets\n"
                   f"  T_L = {self._left_target.tolist()}  (default {left_default.tolist()})\n"
                   f"  T_R = {self._right_target.tolist()}  (default {right_default.tolist()})")
             return
@@ -315,13 +316,11 @@ class DualArmPegHoleEnv(IsaacSim):
             + self._w_success * success
         )
 
-        # 只对 collision 盖 r_min; success 吸收照给 normal (含 w_success 奖励)
+        # collision 是唯一 absorbing 源, 其 reward 盖成 r_min/(1-γ); success 不终止
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
-        collision = self._last_collision_mask
-        if collision is None:
-            r = normal
-        else:
-            r = torch.where(collision, torch.full_like(normal, absorbing_r), normal)
+        r = torch.where(
+            self._last_collision_mask, torch.full_like(normal, absorbing_r), normal
+        )
         return self._reward_scale * r
 
     def setup(self, env_indices, obs):
