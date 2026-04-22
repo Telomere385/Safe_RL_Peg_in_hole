@@ -13,9 +13,9 @@ conda activate safe_rl
 
 依赖：
 
-- `mushroom-rl` 2.0.0rc1 (`dev` 分支), 可编辑安装在 `~/mushroom-rl`
-- IsaacSim (随 mushroom-rl 的 `IsaacSim` env class 走 `pip install isaacsim`)
-- USD: `~/dual_arm_ws/usd_imports/dual_arm_iiwa/dual_arm_iiwa.usd`
+- `mushroom-rl==2.0.0rc1` 和其他 Python 依赖由 `environment.yml` 安装
+- IsaacSim 仍需在目标机器上可用；若环境里没有，补装 `pip install isaacsim`
+- 机器人 USD 资产已经随仓库提供：`assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd`
 
 ## 文件
 
@@ -23,6 +23,9 @@ conda activate safe_rl
 envs/
   dual_arm_peg_hole_env.py   # IsaacSim 子类: 14 DoF velocity, 40 维 obs, reach reward
   __init__.py                # 导出 DualArmPegHoleEnv 与默认目标常量
+assets/
+  usd/
+    dual_arm_iiwa/           # 仓库内置的机器人 USD 资产 (不再依赖 ~/dual_arm_ws)
 networks.py                  # SAC actor / critic MLP (input → 256 → 256 → out)
 scripts/
   train_sac.py               # SAC 训练 (VectorCore, 默认 num_envs=16)
@@ -55,6 +58,15 @@ python scripts/visualize_targets.py
 
 `results/best_agent.msh` 是按 epoch eval 的 J 取最大保存的。wandb 输出
 落在 `results/wandb/`。
+
+## 可移植性
+
+- 仓库内不再依赖 `~/dual_arm_ws/...` 这类本机绝对路径，默认从
+  `assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd` 加载机器人模型。
+- 训练、评估、可视化脚本都用仓库根目录为基准解析本地文件路径，所以项目换到
+  其他目录、或从 GitHub 重新 clone 到另一台机器，都不需要再手改路径。
+- 仍然需要在目标机器上先安装依赖并准备好 IsaacSim 运行环境；这个仓库现在解决
+  的是“项目文件自包含”和“本地路径可移植”，不是免安装运行。
 
 ## Phase 1 任务设定
 

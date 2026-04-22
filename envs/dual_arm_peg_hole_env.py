@@ -41,6 +41,8 @@ Target 生成 (在 __init__ 末尾 eager-init 一次冻结, 固定在 world fram
 Eager-init 后在 env 0 旁边 spawn 红绿可视化球作为目标位置 marker.
 """
 
+from pathlib import Path
+
 import torch
 
 from mushroom_rl.environments import IsaacSim
@@ -48,7 +50,8 @@ from mushroom_rl.utils.isaac_sim import ObservationType, ActionType
 from mushroom_rl.rl_utils.spaces import Box
 
 
-USD_PATH = "/home/miao/dual_arm_ws/usd_imports/dual_arm_iiwa/dual_arm_iiwa.usd"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_USD_PATH = PROJECT_ROOT / "assets" / "usd" / "dual_arm_iiwa" / "dual_arm_iiwa.usd"
 
 CONTROLLED_IDX = (1, 2, 3, 4, 5, 6, 7)  # A1-A7, 7 DoF/臂
 LEFT_ARM_JOINTS = [f"left_arm_A{i}" for i in CONTROLLED_IDX]
@@ -90,6 +93,7 @@ class DualArmPegHoleEnv(IsaacSim):
         target_travel_fraction=0.5,
         left_target=DEFAULT_LEFT_CHEST_TARGET,
         right_target=DEFAULT_RIGHT_CHEST_TARGET,
+        usd_path=None,
     ):
         self._action_scale = action_scale
         self._initial_joint_noise = initial_joint_noise
@@ -105,6 +109,14 @@ class DualArmPegHoleEnv(IsaacSim):
         self._target_travel_fraction = target_travel_fraction
         self._fixed_left_target = left_target
         self._fixed_right_target = right_target
+        self._usd_path = Path(usd_path) if usd_path is not None else DEFAULT_USD_PATH
+        if not self._usd_path.is_file():
+            raise FileNotFoundError(
+                "找不到机器人 USD 资产文件: "
+                f"{self._usd_path}\n"
+                "请确认仓库内存在 assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd，"
+                "或在构造 DualArmPegHoleEnv 时显式传入 usd_path。"
+            )
         self._left_target = None
         self._right_target = None
         # is_absorbing 与 reward 在同一 next_obs 上背靠背调用, 缓存避免重复计算
@@ -124,7 +136,7 @@ class DualArmPegHoleEnv(IsaacSim):
         collision_groups = [("arm_L", LEFT_ARM_GROUP), ("arm_R", RIGHT_ARM_GROUP)]
 
         super().__init__(
-            usd_path=USD_PATH,
+            usd_path=str(self._usd_path),
             actuation_spec=ARM_JOINTS,
             observation_spec=observation_spec,
             backend="torch",

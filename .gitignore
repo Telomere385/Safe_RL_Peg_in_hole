@@ -23,6 +23,12 @@ build/
 *.usdc
 *.usdz
 
+# Track the bundled project USD assets kept under the repo.
+!assets/usd/**/*.usd
+!assets/usd/**/*.usda
+!assets/usd/**/*.usdc
+!assets/usd/**/*.usdz
+
 # IDE
 .vscode/
 .idea/
