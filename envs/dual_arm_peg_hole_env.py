@@ -42,6 +42,7 @@ Eager-init 后在 env 0 旁边 spawn 红绿可视化球作为目标位置 marker
 """
 
 from pathlib import Path
+import re
 
 import torch
 
@@ -51,7 +52,12 @@ from mushroom_rl.rl_utils.spaces import Box
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_USD_PATH = PROJECT_ROOT / "assets" / "usd" / "dual_arm_iiwa" / "dual_arm_iiwa.usd"
+# Phase 1.5 commit 2: 默认切到带 peg/hole 视觉资产的 composed USDA.
+# Check A 已验证过两份 USD 在 articulation 层是物理 no-op, 所以现有
+# phase 1 训练 checkpoint 在这里仍然可以 1:1 复用.
+DEFAULT_USD_PATH = (
+    PROJECT_ROOT / "assets" / "usd" / "dual_arm_iiwa" / "dual_arm_iiwa_with_peghole.usda"
+)
 
 CONTROLLED_IDX = (1, 2, 3, 4, 5, 6, 7)  # A1-A7, 7 DoF/臂
 LEFT_ARM_JOINTS = [f"left_arm_A{i}" for i in CONTROLLED_IDX]
@@ -69,6 +75,23 @@ RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 
 DEFAULT_LEFT_CHEST_TARGET = (-0.80, -0.40, 0.62)
 DEFAULT_RIGHT_CHEST_TARGET = (-0.80, 0.40, 0.62)
+
+# Phase 1.5 commit 2: peg/hole 几何常量 (必须和
+# assets/usd/dual_arm_iiwa/build_peghole_usd.py 保持一致)
+PEG_HEIGHT = 0.035
+HOLE_HEIGHT = 0.030
+
+# peg_tip / hole_entry 在各自 Peg/Hole 局部帧里的位置 (仅作 docstring 参考用, 查询
+# pose 是通过 USD stage 的 XformCache 直接拿, 不在这里做 analytic forward kinematics).
+PEG_TIP_LOCAL = (0.0, 0.0, 0.5 * PEG_HEIGHT)
+HOLE_ENTRY_LOCAL = (0.0, 0.0, 0.5 * HOLE_HEIGHT)
+
+# 相对 peg_tip / hole_entry prim 的稳定路径后缀. 找 cloned env 里对应 prim 用.
+PEG_TIP_SUFFIX = "left_hande_robotiq_hande_link/Peg/peg_tip"
+HOLE_ENTRY_SUFFIX = "right_hande_robotiq_hande_link/Hole/hole_entry"
+
+# 预插入站位: hole_entry 沿 hole_axis 方向后退 preinsert_offset 距离. 默认 5cm.
+DEFAULT_PREINSERT_OFFSET = 0.05
 
 
 class DualArmPegHoleEnv(IsaacSim):
@@ -93,6 +116,7 @@ class DualArmPegHoleEnv(IsaacSim):
         target_travel_fraction=0.5,
         left_target=DEFAULT_LEFT_CHEST_TARGET,
         right_target=DEFAULT_RIGHT_CHEST_TARGET,
+        preinsert_offset=DEFAULT_PREINSERT_OFFSET,
         usd_path=None,
     ):
         self._action_scale = action_scale
@@ -109,6 +133,7 @@ class DualArmPegHoleEnv(IsaacSim):
         self._target_travel_fraction = target_travel_fraction
         self._fixed_left_target = left_target
         self._fixed_right_target = right_target
+        self._preinsert_offset = float(preinsert_offset)
         self._usd_path = Path(usd_path) if usd_path is not None else DEFAULT_USD_PATH
         if not self._usd_path.is_file():
             raise FileNotFoundError(
@@ -126,6 +151,10 @@ class DualArmPegHoleEnv(IsaacSim):
         # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦, 改 action_scale 时
         # 惩罚强度语义不变.
         self._last_raw_action = None
+        self._peg_tip_paths = []
+        self._hole_entry_paths = []
+        self._peg_tip_view = None
+        self._hole_entry_view = None
 
         observation_spec = [
             ("joint_pos", "", ObservationType.JOINT_POS, ARM_JOINTS),
@@ -189,6 +218,34 @@ class DualArmPegHoleEnv(IsaacSim):
             self.observation_helper.get_from_obs(init_obs, "right_ee_pos"),
         )
         self._spawn_target_markers()
+
+        # Phase 1.5 commit 2: 发现 peg/hole 的 cloned prim 路径.
+        # 如果加载的是老 USD (无 peg/hole), 两个列表会是空的, get_preinsert_frames()
+        # 会返回 None. 这时候旧流程 (reaching reward/obs) 不受影响.
+        self._peg_tip_paths = self._find_cloned_prim_paths(PEG_TIP_SUFFIX)
+        self._hole_entry_paths = self._find_cloned_prim_paths(HOLE_ENTRY_SUFFIX)
+        if self._peg_tip_paths and self._hole_entry_paths:
+            from isaacsim.core.prims import XFormPrim
+
+            self._peg_tip_view = XFormPrim(
+                self._peg_tip_paths, name="peg_tip_frame_view", reset_xform_properties=False, usd=False
+            )
+            self._hole_entry_view = XFormPrim(
+                self._hole_entry_paths, name="hole_entry_frame_view", reset_xform_properties=False, usd=False
+            )
+            self._peg_tip_view.initialize()
+            self._hole_entry_view.initialize()
+            print(
+                f"[PREINSERT] peg/hole 视觉资产已加载, "
+                f"cloned 实例数: peg_tip={len(self._peg_tip_paths)}, "
+                f"hole_entry={len(self._hole_entry_paths)}"
+            )
+        else:
+            print(
+                "[PREINSERT] 注意: stage 里没找到 peg_tip / hole_entry prim. "
+                "get_preinsert_frames() 将返回 None. 若不是故意加载无-peghole USD, "
+                "请确认 --usd 或 DEFAULT_USD_PATH 指向 dual_arm_iiwa_with_peghole.usda"
+            )
 
     def _modify_mdp_info(self, mdp_info):
         # action: [-1,1]^14, SAC tanh policy 直接映射
@@ -359,3 +416,146 @@ class DualArmPegHoleEnv(IsaacSim):
         """
         tau_g = self._robots.get_generalized_gravity_forces(clone=False)
         self._robots.set_joint_efforts(tau_g[:, self._cj], joint_indices=self._cj)
+
+    # ------------------------------------------------------------------
+    # Phase 1.5 commit 2: preinsert pose helpers
+    # ------------------------------------------------------------------
+    # 这一组只暴露"读"接口, 不参与 reward / obs / is_absorbing. 训练语义仍然
+    # 是 phase 1 的 reaching. 任务切换留给 commit 3+.
+
+    @staticmethod
+    def _quat_apply(q_wxyz, v):
+        """用单位四元数 q (wxyz 约定) 旋转向量 v. 支持广播.
+
+        Args:
+            q_wxyz: [..., 4]
+            v:      [..., 3]
+        Returns:
+            [..., 3] 旋转后的向量.
+        """
+        w = q_wxyz[..., 0]
+        x = q_wxyz[..., 1]
+        y = q_wxyz[..., 2]
+        z = q_wxyz[..., 3]
+        vx = v[..., 0]
+        vy = v[..., 1]
+        vz = v[..., 2]
+        # 标准公式: v' = v + 2*w*(q_xyz × v) + 2*(q_xyz × (q_xyz × v))
+        tx = 2 * (y * vz - z * vy)
+        ty = 2 * (z * vx - x * vz)
+        tz = 2 * (x * vy - y * vx)
+        rx = vx + w * tx + (y * tz - z * ty)
+        ry = vy + w * ty + (z * tx - x * tz)
+        rz = vz + w * tz + (x * ty - y * tx)
+        return torch.stack([rx, ry, rz], dim=-1)
+
+    @staticmethod
+    def _quat_mul(q1_wxyz, q2_wxyz):
+        """四元数乘法, 支持广播, 输入输出都用 (w, x, y, z)."""
+        w1, x1, y1, z1 = q1_wxyz.unbind(dim=-1)
+        w2, x2, y2, z2 = q2_wxyz.unbind(dim=-1)
+        return torch.stack([
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ], dim=-1)
+
+    def _find_cloned_prim_paths(self, relative_suffix):
+        """遍历 stage 找所有以 relative_suffix 结尾的 prim path, 按字符串排序.
+
+        这样不依赖 cloner 的精确命名模式; 只要 peg_tip/hole_entry 的相对路径在
+        USDA 里是稳定的, 就能发现所有 cloned env 里的副本.
+        """
+        try:
+            import omni.usd
+        except ImportError:
+            return []
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            return []
+        suffix = "/" + relative_suffix.lstrip("/")
+        paths = []
+        for prim in stage.Traverse():
+            p = str(prim.GetPath())
+            if p.endswith(suffix):
+                paths.append(p)
+        def env_sort_key(path):
+            m = re.search(r"/env_(\d+)(?:/|$)", path)
+            return (int(m.group(1)) if m else -1, path)
+        paths.sort(key=env_sort_key)
+        return paths
+
+    def _query_world_pose_quat(self, prim_view):
+        """用 IsaacSim live xform view 查 prim 的世界位姿.
+
+        Returns:
+            pos [N, 3], quat [N, 4] (wxyz), 都在 self._device 上, dtype 与 joint limits 一致.
+        """
+        dtype = self._joint_lower.dtype
+        pos, quat = prim_view.get_world_poses(usd=False)
+        pos = torch.as_tensor(pos, device=self._device, dtype=dtype)
+        quat = torch.as_tensor(quat, device=self._device, dtype=dtype)
+        return pos, quat
+
+    def get_preinsert_frames(self):
+        """返回 peg_tip / hole_entry / preinsert_target 的世界帧位姿.
+
+        这是 phase 1.5 **纯读** helper — 不改 reward/obs/is_absorbing, 不影响训练
+        语义. 留给 visualize_targets (commit 2) 和后续 commit 3 的 task error
+        计算使用.
+
+        Returns None 当 peg/hole 不在 stage 里 (用户加载了老 USD).
+        否则返回 dict of batched tensors (都是世界坐标, batch=num_envs):
+            peg_tip_pos          [N, 3]
+            peg_tip_quat         [N, 4]  wxyz
+            peg_axis             [N, 3]  unit, 就是 peg 本地 +Z 在世界里的方向
+            hole_entry_pos       [N, 3]
+            hole_entry_quat      [N, 4]
+            hole_axis            [N, 3]  unit, hole 开口朝向 (hole 本地 +Z 在世界)
+            preinsert_target_pos [N, 3]  hole_entry_pos + preinsert_offset * hole_axis
+            preinsert_target_quat[N, 4]  = hole_entry_quat (同一帧)
+
+        几何含义: peg/hole 都是圆柱, 它们的 local +Z 即对称轴. peg 从 preinsert_target
+        沿 -hole_axis 方向往 hole_entry 插入 -> 理想装配时
+        dot(peg_axis, hole_axis) ≈ -1 (轴反平行, 面对面).
+        """
+        if self._peg_tip_view is None or self._hole_entry_view is None:
+            return None
+        if (len(self._peg_tip_paths) != self._n_envs
+                or len(self._hole_entry_paths) != self._n_envs):
+            print(
+                "[PREINSERT] prim 数量与 num_envs 不一致, "
+                f"peg_tip={len(self._peg_tip_paths)} "
+                f"hole_entry={len(self._hole_entry_paths)} "
+                f"num_envs={self._n_envs}"
+            )
+            return None
+
+        peg_tip_pos, peg_tip_quat = self._query_world_pose_quat(self._peg_tip_view)
+        hole_entry_pos, hole_entry_quat = self._query_world_pose_quat(self._hole_entry_view)
+
+        unit_z = torch.zeros_like(peg_tip_pos)
+        unit_z[..., 2] = 1.0
+        flip_x_180 = torch.zeros_like(peg_tip_quat)
+        flip_x_180[..., 1] = 1.0
+        peg_axis_quat = self._quat_mul(peg_tip_quat, flip_x_180)
+        peg_axis = self._quat_apply(peg_axis_quat, unit_z)
+        hole_axis_quat = hole_entry_quat
+        hole_axis = self._quat_apply(hole_entry_quat, unit_z)
+
+        preinsert_target_pos = hole_entry_pos + self._preinsert_offset * hole_axis
+        preinsert_target_quat = hole_entry_quat.clone()
+
+        return {
+            "peg_tip_pos": peg_tip_pos,
+            "peg_tip_quat": peg_tip_quat,
+            "peg_axis_quat": peg_axis_quat,
+            "peg_axis": peg_axis,
+            "hole_entry_pos": hole_entry_pos,
+            "hole_entry_quat": hole_entry_quat,
+            "hole_axis_quat": hole_axis_quat,
+            "hole_axis": hole_axis,
+            "preinsert_target_pos": preinsert_target_pos,
+            "preinsert_target_quat": preinsert_target_quat,
+        }

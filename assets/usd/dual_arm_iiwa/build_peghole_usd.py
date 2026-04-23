@@ -1,0 +1,214 @@
+"""生成 dual_arm_iiwa_with_peghole.usda — 机器人 + 视觉 peg/hole 的 composed 资产.
+
+Phase 1.5 commit 1: 仅改 assets/. 不改 env / scripts.
+只加 "几何 + 可定位的 peg_tip / hole_entry 参考帧" 到资产层, 为后续 commit 准备.
+
+-- 关键设计: peg/hole 是纯视觉 -----------------------------------------------
+本文件通过 USD references 引用原始 ``dual_arm_iiwa.usd`` (robot 0 修改),
+然后用 ``over`` 在左/右 EE link 下挂 Peg / Hole prim. Peg 和 Hole:
+  * 没有 RigidBodyAPI  -> 不是动力学刚体, 不进入 articulation 计算
+  * 没有 MassAPI        -> 对 G(q) 重力补偿 0 贡献
+  * 没有 CollisionAPI   -> 不进入 CollisionHelper, 不产生接触
+它们只是 EE link 的场景图子节点, 渲染时跟随 EE 位姿变化.
+
+这一步**物理上是 no-op**: 新资产加载后, robot 的 DoF 数、质量矩阵、collider
+集合与原 ``dual_arm_iiwa.usd`` 完全相同. 唯一差别是场景里多了两个可查询
+pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
+
+-- 稳定的 prim 路径 (env 代码在后续 commit 引用) ----------------------------
+  /bh_robot/left_hande_robotiq_hande_link/Peg
+  /bh_robot/left_hande_robotiq_hande_link/Peg/peg_tip
+  /bh_robot/right_hande_robotiq_hande_link/Hole
+  /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
+
+-- 几何与挂载参数 (照抄 ~/init_peg_hole_env.py) -----------------------------
+  PEG:  实心圆柱, radius=0.008, height=0.035, 轴 = local Z.
+  HOLE: 空心圆柱 mesh, outer_r=0.012, inner_r=0.010, height=0.030,
+        底封顶开 (方便 peg 从 +Z 插入).
+  挂载: translate = (PART_X, 0, PART_Z), orient = 绕 local X 转 +90°.
+        结果: peg/hole 的轴 (local Z) 在 EE 帧里指向 EE 的 -Y 方向
+        (即垂直于手指开合方向), 参考实现在 init_peg_hole_env.py:149-162.
+
+-- 运行 ---------------------------------------------------------------------
+  python assets/usd/dual_arm_iiwa/build_peghole_usd.py
+输出 dual_arm_iiwa_with_peghole.usda 会放到本脚本同目录.
+"""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+
+
+# 几何 ----------------------------------------------------------------------
+PEG_RADIUS   = 0.008
+PEG_HEIGHT   = 0.035
+HOLE_OUTER_R = 0.012
+HOLE_INNER_R = 0.010
+HOLE_HEIGHT  = 0.030
+
+# 挂载偏移 (EE 本地帧, 应用 orient 之前) --------------------------------------
+PART_X = -0.0055   # 补偿夹爪 mimic 不对称的横向微偏
+PART_Z =  0.125    # 指间区域中心沿 EE 局部 +Z 的距离
+
+# 绕 local +X 旋转 +90°: quat (w, x, y, z) = (cos(π/4), sin(π/4), 0, 0) --------
+_HALF = math.pi / 4
+_C = math.cos(_HALF)
+_S = math.sin(_HALF)
+
+# 颜色 ----------------------------------------------------------------------
+PEG_COLOR  = (0.85, 0.12, 0.10)   # red
+HOLE_COLOR = (0.20, 0.75, 0.20)   # green
+
+# hollow cylinder mesh 分段数 --------------------------------------------------
+NUM_SEGMENTS = 48
+
+HERE = Path(__file__).resolve().parent
+ROBOT_USD_REL = "./dual_arm_iiwa.usd"      # 被引用的原始 robot USD (同目录)
+OUTPUT = HERE / "dual_arm_iiwa_with_peghole.usda"
+
+
+def hollow_cylinder_mesh(outer_r: float, inner_r: float, height: float,
+                         n_seg: int = NUM_SEGMENTS):
+    """底封顶开的空心圆柱 mesh. 镜像 init_peg_hole_env.create_hollow_cylinder().
+
+    顶点索引约定:
+        [0..n_seg)          底面外环
+        [n_seg..2n_seg)     底面内环
+        [2n_seg..3n_seg)    顶面外环
+        [3n_seg..4n_seg)    顶面内环
+        4n_seg              底部中心 (用于 triangle fan 封底)
+    """
+    half_h = 0.5 * height
+    angles = np.linspace(0.0, 2.0 * np.pi, n_seg, endpoint=False)
+    ca, sa = np.cos(angles), np.sin(angles)
+
+    pts: list[tuple[float, float, float]] = []
+    for r, z in [(outer_r, -half_h), (inner_r, -half_h),
+                 (outer_r,  half_h), (inner_r,  half_h)]:
+        for i in range(n_seg):
+            pts.append((float(r * ca[i]), float(r * sa[i]), float(z)))
+    pts.append((0.0, 0.0, float(-half_h)))  # 底部中心
+
+    center = 4 * n_seg
+    fvc: list[int] = []
+    fvi: list[int] = []
+    for i in range(n_seg):
+        j = (i + 1) % n_seg
+        # 外壁 quad
+        fvc.append(4); fvi.extend([i, j, 2 * n_seg + j, 2 * n_seg + i])
+        # 内壁 quad
+        fvc.append(4); fvi.extend([n_seg + i, 3 * n_seg + i, 3 * n_seg + j, n_seg + j])
+        # 顶面环 quad
+        fvc.append(4); fvi.extend([2 * n_seg + i, 2 * n_seg + j,
+                                    3 * n_seg + j, 3 * n_seg + i])
+        # 底面外环 quad
+        fvc.append(4); fvi.extend([i, n_seg + i, n_seg + j, j])
+        # 底面中心 triangle (封底)
+        fvc.append(3); fvi.extend([center, n_seg + j, n_seg + i])
+    return pts, fvc, fvi
+
+
+def _fmt_vec3_array(pts) -> str:
+    return "[" + ", ".join(f"({p[0]:.6f}, {p[1]:.6f}, {p[2]:.6f})" for p in pts) + "]"
+
+
+def _fmt_int_array(arr, per_line: int = 20) -> str:
+    lines: list[str] = []
+    for i in range(0, len(arr), per_line):
+        lines.append(", ".join(str(x) for x in arr[i:i + per_line]))
+    return "[" + ",\n                    ".join(lines) + "]"
+
+
+def build() -> None:
+    hole_pts, hole_fvc, hole_fvi = hollow_cylinder_mesh(
+        HOLE_OUTER_R, HOLE_INNER_R, HOLE_HEIGHT
+    )
+    peg_tip_z    = 0.5 * PEG_HEIGHT     # tip 在 peg 本地 +Z 面中心
+    hole_entry_z = 0.5 * HOLE_HEIGHT    # entry 在 hole 本地 +Z 面 (开口)中心
+
+    usda = f"""#usda 1.0
+(
+    defaultPrim = "bh_robot"
+    upAxis = "Z"
+    metersPerUnit = 1.0
+    doc = \"\"\"Composed stage: robot + visual peg (left EE) / hole (right EE).
+Generated by build_peghole_usd.py.
+
+Peg 和 Hole 是视觉-only 子节点, 没有 RigidBodyAPI / MassAPI / CollisionAPI,
+不改变 articulation DoF, 质量矩阵 (G(q)), 或 collider 集合.
+
+稳定 prim 路径 (env 代码引用):
+    /bh_robot/left_hande_robotiq_hande_link/Peg
+    /bh_robot/left_hande_robotiq_hande_link/Peg/peg_tip
+    /bh_robot/right_hande_robotiq_hande_link/Hole
+    /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
+
+挂载: translate=({PART_X}, 0, {PART_Z}) + orient=90°/X.
+几何: PEG radius={PEG_RADIUS}, height={PEG_HEIGHT};
+      HOLE outer_r={HOLE_OUTER_R}, inner_r={HOLE_INNER_R}, height={HOLE_HEIGHT}.
+\"\"\"
+)
+
+def Xform "bh_robot" (
+    prepend references = @{ROBOT_USD_REL}@</bh_robot>
+)
+{{
+    over "left_hande_robotiq_hande_link"
+    {{
+        def Xform "Peg"
+        {{
+            float3 xformOp:translate = ({PART_X:.6f}, 0.000000, {PART_Z:.6f})
+            quatf xformOp:orient = ({_C:.8f}, {_S:.8f}, 0.0, 0.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Cylinder "Geom"
+            {{
+                double radius = {PEG_RADIUS:.6f}
+                double height = {PEG_HEIGHT:.6f}
+                uniform token axis = "Z"
+                color3f[] primvars:displayColor = [({PEG_COLOR[0]}, {PEG_COLOR[1]}, {PEG_COLOR[2]})]
+            }}
+
+            def Xform "peg_tip"
+            {{
+                float3 xformOp:translate = (0.000000, 0.000000, {peg_tip_z:.6f})
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }}
+        }}
+    }}
+
+    over "right_hande_robotiq_hande_link"
+    {{
+        def Xform "Hole"
+        {{
+            float3 xformOp:translate = ({PART_X:.6f}, 0.000000, {PART_Z:.6f})
+            quatf xformOp:orient = ({_C:.8f}, {_S:.8f}, 0.0, 0.0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
+
+            def Mesh "Geom"
+            {{
+                point3f[] points = {_fmt_vec3_array(hole_pts)}
+                int[] faceVertexCounts = {_fmt_int_array(hole_fvc)}
+                int[] faceVertexIndices = {_fmt_int_array(hole_fvi)}
+                uniform token subdivisionScheme = "none"
+                bool doubleSided = true
+                color3f[] primvars:displayColor = [({HOLE_COLOR[0]}, {HOLE_COLOR[1]}, {HOLE_COLOR[2]})]
+            }}
+
+            def Xform "hole_entry"
+            {{
+                float3 xformOp:translate = (0.000000, 0.000000, {hole_entry_z:.6f})
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }}
+        }}
+    }}
+}}
+"""
+    OUTPUT.write_text(usda)
+    print(f"wrote {OUTPUT}  ({OUTPUT.stat().st_size} bytes)")
+
+
+if __name__ == "__main__":
+    build()
