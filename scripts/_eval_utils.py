@@ -66,3 +66,25 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
         "left_pos_err_mean": float(left_err.mean()),
         "right_pos_err_mean": float(right_err.mean()),
     }
+
+
+def resolve_eval_episode_count(requested_episodes, num_envs, arg_name):
+    """评估 episode 数与 vectorized env 对齐.
+
+    `VectorCore.evaluate(n_episodes=...)` 在尾批不足时会把 inactive env teleport away。
+    现在 env 已经不会再用这些状态初始化 target, 但渲染里仍会看到"飞天"机器人。
+    为了避免这个现象, 统一要求 eval 的 episode 数是 num_envs 的整数倍。
+    """
+    if requested_episodes is None:
+        return num_envs
+    if requested_episodes < num_envs:
+        raise ValueError(
+            f"{arg_name} ({requested_episodes}) 不能小于 num_envs ({num_envs}). "
+            "否则 evaluate 的 inactive env 会被 teleport away。"
+        )
+    if requested_episodes % num_envs != 0:
+        raise ValueError(
+            f"{arg_name} ({requested_episodes}) 必须能被 num_envs ({num_envs}) 整除, "
+            "否则最后一批会留下 inactive env 被 teleport away。"
+        )
+    return requested_episodes

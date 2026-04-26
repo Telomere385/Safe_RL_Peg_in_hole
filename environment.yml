@@ -8,6 +8,8 @@ dependencies:
   - pip:
     - torch==2.7.0
     - numpy==1.26.0
-    - mushroom-rl==2.0.0rc1
+    # mushroom-rl 2.0 还没正式发布; pin 到 dev 分支 (= 我们一直在用的 2.0 主线).
+    # 上游 PyPI 的 2.0.0rc1 比 dev 落后, 跑这个项目对不齐.
+    - git+https://github.com/MushroomRL/mushroom-rl.git@dev
     - wandb
     # IsaacSim 由 mushroom-rl 2.0 的 IsaacSim 环境类托管 (pip install isaacsim 即可)

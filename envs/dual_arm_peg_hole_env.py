@@ -76,16 +76,6 @@ RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 DEFAULT_LEFT_CHEST_TARGET = (-0.80, -0.40, 0.62)
 DEFAULT_RIGHT_CHEST_TARGET = (-0.80, 0.40, 0.62)
 
-# Phase 1.5 commit 2: peg/hole 几何常量 (必须和
-# assets/usd/dual_arm_iiwa/build_peghole_usd.py 保持一致)
-PEG_HEIGHT = 0.035
-HOLE_HEIGHT = 0.030
-
-# peg_tip / hole_entry 在各自 Peg/Hole 局部帧里的位置 (仅作 docstring 参考用, 查询
-# pose 是通过 USD stage 的 XformCache 直接拿, 不在这里做 analytic forward kinematics).
-PEG_TIP_LOCAL = (0.0, 0.0, 0.5 * PEG_HEIGHT)
-HOLE_ENTRY_LOCAL = (0.0, 0.0, 0.5 * HOLE_HEIGHT)
-
 # 相对 peg_tip / hole_entry prim 的稳定路径后缀. 找 cloned env 里对应 prim 用.
 PEG_TIP_SUFFIX = "left_hande_robotiq_hande_link/Peg/peg_tip"
 HOLE_ENTRY_SUFFIX = "right_hande_robotiq_hande_link/Hole/hole_entry"
@@ -111,6 +101,9 @@ class DualArmPegHoleEnv(IsaacSim):
         rew_success=2.0,
         rew_joint_limit=0.02,
         rew_action=0.005,
+        rew_inthresh_vel=0.0,
+        success_hold_steps=10,
+        terminal_hold_bonus=0.0,
         success_pos_threshold=0.075,
         joint_limit_margin_frac=0.8,
         target_travel_fraction=0.5,
@@ -128,6 +121,15 @@ class DualArmPegHoleEnv(IsaacSim):
         self._w_success = rew_success
         self._w_joint_limit = rew_joint_limit
         self._w_action = rew_action
+        # 阈值内的关节速度惩罚: 杀死 "到达后立刻飘走" 的 drift-out 行为. 0 = 关闭.
+        self._w_inthresh_vel = rew_inthresh_vel
+        # hold-N absorbing 设计: 连续 N 步在阈内即触发 episode 终止 + terminal bonus.
+        # terminal_hold_bonus=0 时整个机制关闭 (Step 2 baseline 行为).
+        # bonus 量级估算: ≥ b × (1-γ^(H-N))/(1-γ) × 安全余量, b=per-step success bonus.
+        # 例 (b=0.5, γ=0.99, H=150, N=10): 公式 ≈ 50, 取 150 给 3× 余量.
+        self._success_hold_steps = int(success_hold_steps)
+        self._terminal_hold_bonus = float(terminal_hold_bonus)
+        self._absorbing_terminal_active = self._terminal_hold_bonus > 0.0
         self._success_pos_threshold = success_pos_threshold
         self._joint_limit_margin_frac = joint_limit_margin_frac
         self._target_travel_fraction = target_travel_fraction
@@ -151,8 +153,8 @@ class DualArmPegHoleEnv(IsaacSim):
         # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦, 改 action_scale 时
         # 惩罚强度语义不变.
         self._last_raw_action = None
-        self._peg_tip_paths = []
-        self._hole_entry_paths = []
+        # _view 由 peg/hole prim 发现块按需赋值; 老 USD 没 peg/hole 就保持 None,
+        # get_preinsert_frames() 据此返回 None.
         self._peg_tip_view = None
         self._hole_entry_view = None
 
@@ -205,6 +207,14 @@ class DualArmPegHoleEnv(IsaacSim):
 
         # 累计碰撞终止次数 (train_sac 每 epoch 读取 + 上一 epoch 值做差分 → 本 epoch 新增).
         self._absorb_count = 0
+
+        # hold-N 计数器 (per env). 每个 env 一个 long, success_mask=True 累加, False 清零.
+        # is_absorbing 里更新, reward 里读 cache (_last_hold_done_mask).
+        # setup() 在 episode reset 时把对应 env 的 counter 清零.
+        self._consecutive_inthresh = torch.zeros(
+            self._n_envs, dtype=torch.long, device=self._device
+        )
+        self._last_hold_done_mask = None
 
         # Eager-init targets 在所有 step_all/teleport_away 之前: super().__init__()
         # 已经跑过 self._world.reset(), 16 个 env 的 robot 都在 USD default pose
@@ -354,12 +364,29 @@ class DualArmPegHoleEnv(IsaacSim):
         self._absorb_count += int(collision.sum().item())
         self._last_collision_mask = collision
 
-        # success 不再触发 absorbing; 但仍需算 task errors 给 reward 用 (dwell bonus).
+        # task errors 算给 reward 用 (dwell bonus + hold-N counter)
         self._last_task_errors = self._compute_task_errors(obs)
-        return collision
+        _, _, success_mask = self._last_task_errors
+
+        # 更新 per-env 的连续 in-threshold 计数: in 阈值则 +1, 否则清零
+        self._consecutive_inthresh = torch.where(
+            success_mask,
+            self._consecutive_inthresh + 1,
+            torch.zeros_like(self._consecutive_inthresh),
+        )
+
+        # hold-N absorbing 仅当 terminal_hold_bonus > 0 时启用. baseline (=0) 行为完全保留.
+        if self._absorbing_terminal_active:
+            hold_done = self._consecutive_inthresh >= self._success_hold_steps
+        else:
+            hold_done = torch.zeros_like(collision)
+        self._last_hold_done_mask = hold_done
+
+        return collision | hold_done
 
     def reward(self, obs, action, next_obs, absorbing):
         joint_pos = self.observation_helper.get_from_obs(next_obs, "joint_pos")
+        joint_vel = self.observation_helper.get_from_obs(next_obs, "joint_vel")
         # is_absorbing 已在同一 next_obs 上算过, 直接复用
         left_pos_err, right_pos_err, success_mask = self._last_task_errors
         success = success_mask.to(left_pos_err.dtype)
@@ -378,17 +405,33 @@ class DualArmPegHoleEnv(IsaacSim):
         # action L2: 用 cache 的 raw action (pre-scale), 和 action_scale 解耦
         action_sq = (self._last_raw_action ** 2).sum(dim=-1)
 
+        # 阈值内的关节速度惩罚: 只在已经 reach 时罚速度, 强迫 agent 学会停下来.
+        # 不在阈值时为 0, 不影响初始 reaching 阶段的探索.
+        joint_vel_sq = (joint_vel ** 2).sum(dim=-1)
+        inthresh_vel_pen = success * joint_vel_sq
+
         normal = (
             -self._w_pos * (left_pos_err + right_pos_err)
             - self._w_joint_limit * joint_limit_norm
             - self._w_action * action_sq
+            - self._w_inthresh_vel * inthresh_vel_pen
             + self._w_success * success
         )
 
-        # collision 是唯一 absorbing 源, 其 reward 盖成 r_min/(1-γ); success 不终止
+        # 三路 reward 选择:
+        #   collision  → r_min/(1-γ) (硬 absorbing, 失败终结)
+        #   hold-N done → normal + terminal_hold_bonus (软 absorbing, 成功终结)
+        #   其他       → normal
+        # 嵌套 where 让 collision 优先 (同时为 True 时按 collision 处理).
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
-            self._last_collision_mask, torch.full_like(normal, absorbing_r), normal
+            self._last_collision_mask,
+            torch.full_like(normal, absorbing_r),
+            torch.where(
+                self._last_hold_done_mask,
+                normal + self._terminal_hold_bonus,
+                normal,
+            ),
         )
         return self._reward_scale * r
 
@@ -401,9 +444,36 @@ class DualArmPegHoleEnv(IsaacSim):
         self._write_data("joint_pos", joint_pos, env_indices)
         self._write_data("joint_vel", torch.zeros_like(joint_pos), env_indices)
 
+        # 重置正在 reset 的 env 的 hold counter, 避免上一 episode 累计的步数泄漏到下一个
+        idx_tensor = torch.as_tensor(env_indices, device=self._device, dtype=torch.long)
+        self._consecutive_inthresh[idx_tensor] = 0
+
         # set_joint_positions 只写 DOF buffer; 不 step 的话 BODY_POS view 还是
         # reset 前的值, reset_all 读到的 EE 位姿是 stale 的.
         self._world.step(render=False)
+
+    def get_obs_scale(self):
+        """40 维 fixed-divisor 归一化向量, 与 observation_space 一一对应.
+
+        对应顺序 (与 _create_observation 输出一致):
+            joint_pos[14], joint_vel[14], left_ee[3], right_ee[3],
+            left_rel_goal[3], right_rel_goal[3]
+
+        缩放选择 (大致让每维标准差落到 ~1):
+            joint_pos: 半关节范围 (~1.5-3 rad/joint)
+            joint_vel: 2.0 rad/s (iiwa velocity-mode 典型上限)
+            ee / rel: 1.0 m (机器人 reach + 目标点距离量级)
+
+        网络在 forward 第一行除以这个 scale, env 内部 obs 仍是物理单位 (米/弧度),
+        所以 _compute_task_errors 等内部读 obs 的代码不受影响.
+        """
+        device = self._joint_lower.device
+        dtype = torch.float32  # 网络一律用 float32, 这里直接对齐
+        joint_pos_scale = 0.5 * (self._joint_upper - self._joint_lower).to(dtype)
+        joint_vel_scale = torch.full_like(joint_pos_scale, 2.0)
+        ee_scale = torch.full((6,), 1.0, device=device, dtype=dtype)
+        rel_scale = torch.full((6,), 1.0, device=device, dtype=dtype)
+        return torch.cat([joint_pos_scale, joint_vel_scale, ee_scale, rel_scale])
 
     def _simulation_pre_step(self):
         """每 intermediate step 物理前施加重力补偿前馈.

@@ -27,7 +27,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from networks import ActorNetwork, CriticNetwork
-from scripts._eval_utils import compute_hold_metrics, deterministic_policy
+from scripts._eval_utils import (
+    compute_hold_metrics,
+    deterministic_policy,
+    resolve_eval_episode_count,
+)
 
 
 INITIAL_REPLAY_SIZE = 10_000
@@ -54,8 +58,9 @@ def parse_args():
                    help="alpha 上限, 抑制高维动作下 entropy 奖励压过任务 reward")
     p.add_argument("--target_entropy", type=float, default=None,
                    help="目标 entropy. 默认自动取 -act_dim (SAC 标准设置)")
-    p.add_argument("--n_eval_episodes", type=int, default=16,
-                   help="评估 episode 数. 默认 16, 降低初始位随机性对 eval J/R 的噪声")
+    p.add_argument("--n_eval_episodes", type=int, default=None,
+                   help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除, "
+                        "避免尾批 inactive env 被 teleport away")
     p.add_argument("--target_travel_fraction", type=float, default=None,
                    help="显式切回 fraction 目标模式时使用的内收比例 f. "
                         "若不传, 默认使用胸前固定目标点")
@@ -71,9 +76,15 @@ def parse_args():
                    help="覆盖 env 的位置成功阈值")
     p.add_argument("--rew_action", type=float, default=None,
                    help="覆盖 env 的动作 L2 惩罚权重")
+    p.add_argument("--rew_success", type=float, default=None,
+                   help="覆盖 env 的 per-step success bonus (默认 2.0)")
+    p.add_argument("--terminal_hold_bonus", type=float, default=None,
+                   help="hold-N 步成功后的终结 bonus + episode 终止. "
+                        "0 = 关闭 (baseline). >0 启用 absorbing termination.")
     p.add_argument("--hold_success_steps", type=int, default=10,
-                   help="eval success 定义: 一个 episode 内至少出现连续 N 步都在阈值内. "
-                        "N=10 ≈ 1s hold (per-step dt≈0.1s)")
+                   help="eval success 定义 + env 终止阈值: 连续 N 步都在阈值内. "
+                        "N=10 ≈ 1s hold (per-step dt≈0.1s). "
+                        "若 --terminal_hold_bonus > 0, 这个 N 也是 env absorbing 触发条件.")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -105,16 +116,16 @@ def main():
             f"n_steps_per_fit ({args.n_steps_per_fit}) 必须能被 num_envs ({args.num_envs}) 整除, "
             "否则会截断半个 vector-step"
         )
-    if args.n_steps_per_epoch % args.num_envs != 0:
-        raise ValueError(
-            f"n_steps_per_epoch ({args.n_steps_per_epoch}) 必须能被 num_envs ({args.num_envs}) 整除"
-        )
     if args.n_steps_per_epoch % args.n_steps_per_fit != 0:
         raise ValueError(
             f"n_steps_per_epoch ({args.n_steps_per_epoch}) 必须能被 "
             f"n_steps_per_fit ({args.n_steps_per_fit}) 整除, 否则 VectorCore 会在 "
             "epoch 末尾丢弃未 fit 的残余 transition"
         )
+    # 注: n_steps_per_epoch % num_envs == 0 由上面两条共同蕴含, 不必单独校验
+    args.n_eval_episodes = resolve_eval_episode_count(
+        args.n_eval_episodes, args.num_envs, "--n_eval_episodes"
+    )
 
     from envs import (
         DEFAULT_LEFT_CHEST_TARGET,
@@ -139,10 +150,13 @@ def main():
         )
     else:
         env_kwargs["target_travel_fraction"] = args.target_travel_fraction
-    for key in ("initial_joint_noise", "success_pos_threshold", "rew_action"):
+    for key in ("initial_joint_noise", "success_pos_threshold", "rew_action",
+                "rew_success", "terminal_hold_bonus"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
+    # env 用同一个 hold N 做 absorbing termination + eval metric, 一次性同步
+    env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
 
@@ -156,6 +170,8 @@ def main():
     if target_entropy is None:
         target_entropy = -float(act_dim)
 
+    # baseline 不做 obs 归一化, 网络默认不注册 _obs_scale buffer (forward 里 hasattr fallback).
+    # 后续若要开归一化, 在这里加 `obs_scale=mdp.get_obs_scale().detach().cpu().tolist()`.
     actor_params = dict(network=ActorNetwork, input_shape=(obs_dim,),
                         output_shape=(act_dim,))
     actor_optimizer = {"class": optim.Adam, "params": {"lr": args.lr_actor}}
@@ -190,8 +206,14 @@ def main():
 
     results_dir = PROJECT_ROOT / "results"
     results_dir.mkdir(exist_ok=True)
+    # 杜绝 stale checkpoint: 上一 run 的 best_agent.msh 留下来会让人误以为本次的
+    # best 在那里. best_score gate (>0 才存) 在全程没成功时不会保存, 必须先删.
+    best_path = results_dir / "best_agent.msh"
+    if best_path.exists():
+        best_path.unlink()
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
+    logger.info(f"清理旧 best checkpoint (本次 run 自建): {best_path}")
     logger.info(f"obs_dim={obs_dim}  act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
     logger.info(f"target_entropy={target_entropy:.3f}  "
@@ -245,6 +267,14 @@ def main():
                 f"vector-steps/epoch≈{vector_steps_per_epoch:.1f}")
 
     best_J = -np.inf
+    # best 选择策略两选一:
+    # - terminal_hold_bonus > 0 (absorbing 启用): 用 best_J, 因为 J 直接包含 terminal bonus
+    #   信号, 量级压过 drift-out 噪声; 而 hold_success_rate × max_hold_mean 会被 hold-N
+    #   的 absorbing 钉住 (max_hold 上限 = N), 一旦 sr=1.0 就封顶, 后续更优策略存不下.
+    # - terminal_hold_bonus = 0 (baseline): 用 best_score, 因为长 horizon 下 J 受
+    #   drift-out 噪声污染, 跨 epoch 比较不稳.
+    best_score = -np.inf
+    use_J_for_best = mdp._terminal_hold_bonus > 0
     total_env_steps = INITIAL_REPLAY_SIZE
     absorb_prev = mdp._absorb_count  # warmup 期间的碰撞从 epoch 计数中扣除
     for epoch in range(args.n_epochs):
@@ -269,14 +299,22 @@ def main():
         ep_len = len(dataset) / args.n_eval_episodes
         m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
 
-        if J > best_J:
+        improved_J = J > best_J
+        if improved_J:
             best_J = J
+        score = m['hold_success_rate'] * m['max_hold_mean']
+        improved_score = m['hold_success_rate'] > 0 and score > best_score
+        if improved_score:
+            best_score = score
+        # 选 best: 见上面 use_J_for_best 注释
+        save_now = improved_J if use_J_for_best else improved_score
+        if save_now:
             agent.save(str(results_dir / "best_agent.msh"))
 
         # 下一 epoch 的 train 计数从 eval 结束后开始 (丢弃 eval 期间的碰撞)
         absorb_prev = mdp._absorb_count
 
-        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J,
+        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J, best_score=best_score,
                           absorb_epoch=absorb_epoch)
         logger.info("eval stats: "
                     f"hold_success_rate={m['hold_success_rate']:.3f} "
@@ -289,7 +327,8 @@ def main():
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
-                "J": J, "R": R, "best_J": best_J, "eval_ep_len": ep_len,
+                "J": J, "R": R, "best_J": best_J, "best_score": best_score,
+                "eval_ep_len": ep_len,
                 "eval_success_rate": m["hold_success_rate"],
                 "eval_max_hold_mean": m["max_hold_mean"],
                 "eval_in_thresh_rate": m["in_thresh_rate"],
@@ -300,9 +339,10 @@ def main():
                 "absorb_per_epoch": absorb_epoch,
             }, step=epoch + 1)
 
-    logger.info(f"训练完成. best J = {best_J:.3f}")
+    logger.info(f"训练完成. best J = {best_J:.3f}  best_score = {best_score:.3f}")
     if wandb_run is not None:
         wandb_run.summary["best_J"] = best_J
+        wandb_run.summary["best_score"] = best_score
         wandb_run.finish()
     mdp.stop()
 
