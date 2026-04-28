@@ -1,16 +1,33 @@
-"""SAC 训练 — 双臂末端到达固定点 (mushroom-rl + VectorCore).
+"""SAC 训练 — 双臂 peg-in-hole preinsert (stage flag 化, mushroom-rl + VectorCore).
 
-phase 1: 纯位置 reaching, 14 维 joint velocity 动作, 40 维 obs.
+obs 32 维 (joint_pos+joint_vel+pos_vec+axis_dot), 同一个 env / 同一个 obs / 同一条
+reward 骨架. stage 用 reward 权重 + success_axis_threshold 切换:
+
+    M1' = pos-only           --rew_axis 0.0  --success_axis_threshold inf
+    M2a = pos + 粗轴对齐      --rew_axis 1.0  --success_axis_threshold 0.5
+    M2b = pos + 紧轴对齐      --rew_axis 1.0  --success_axis_threshold 0.2
+
+M2a/M2b 用 --load_agent path/to/M1p_checkpoint.msh 续训, 不用 cold start.
 
 运行:
     conda activate safe_rl
-    python scripts/train_sac.py
-    python scripts/train_sac.py --target_travel_fraction 0.25 --initial_joint_noise 0.05
-    python scripts/train_sac.py --left_target -0.62 -0.55 0.69 --right_target -0.62 0.38 0.74
-    python scripts/train_sac.py --render
-    python scripts/train_sac.py --no_wandb
+    # M1': 建立 32 维 baseline (相当于 pos-only)
+    python scripts/train_sac.py --no_wandb \\
+        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50
 
-注意: num_envs=1 会触发 IsaacSim cloner 的 `*` pattern 失败 → 至少 2.
+    # M2a: 从 M1' warm-start, 加 axis reward
+    python scripts/train_sac.py --no_wandb \\
+        --load_agent results/best_agent_M1p_32dim_pos10cm.msh \\
+        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_axis 1.0 --success_axis_threshold 0.5
+
+    # M2b: 从 M2a 收紧
+    python scripts/train_sac.py --no_wandb \\
+        --load_agent results/best_agent_M2a_axis05.msh \\
+        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_axis 1.0 --success_axis_threshold 0.2
+
+注意: num_envs=1 触发 IsaacSim cloner 的 `*` pattern 失败 → 至少 2.
 """
 
 import argparse
@@ -59,32 +76,38 @@ def parse_args():
     p.add_argument("--target_entropy", type=float, default=None,
                    help="目标 entropy. 默认自动取 -act_dim (SAC 标准设置)")
     p.add_argument("--n_eval_episodes", type=int, default=None,
-                   help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除, "
-                        "避免尾批 inactive env 被 teleport away")
-    p.add_argument("--target_travel_fraction", type=float, default=None,
-                   help="显式切回 fraction 目标模式时使用的内收比例 f. "
-                        "若不传, 默认使用胸前固定目标点")
-    p.add_argument("--left_target", type=float, nargs=3, default=None,
-                   metavar=("X", "Y", "Z"),
-                   help="显式指定左臂固定目标点 (world/env-local frame)")
-    p.add_argument("--right_target", type=float, nargs=3, default=None,
-                   metavar=("X", "Y", "Z"),
-                   help="显式指定右臂固定目标点 (world/env-local frame)")
+                   help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
     p.add_argument("--initial_joint_noise", type=float, default=None,
                    help="覆盖 env 的 reset 关节噪声")
-    p.add_argument("--success_pos_threshold", type=float, default=None,
-                   help="覆盖 env 的位置成功阈值")
+    p.add_argument("--preinsert_success_pos_threshold", type=float, default=None,
+                   help="覆盖 env 的 preinsert 位置成功阈值 (env 默认 0.10m, 即当前 "
+                        "M1'/M2 curriculum). 如果显式想跑老 5cm, 传 0.05.")
+    p.add_argument("--preinsert_offset", type=float, default=None,
+                   help="覆盖 env 的 preinsert offset (默认 0.05m)")
     p.add_argument("--rew_action", type=float, default=None,
                    help="覆盖 env 的动作 L2 惩罚权重")
     p.add_argument("--rew_success", type=float, default=None,
                    help="覆盖 env 的 per-step success bonus (默认 2.0)")
+    p.add_argument("--rew_axis", type=float, default=None,
+                   help="覆盖 env 的 axis_err 权重 (默认 0.0 = M1' pos-only). "
+                        "M2a/M2b 设 1.0 启用轴对齐惩罚.")
+    p.add_argument("--success_axis_threshold", type=float, default=None,
+                   help="覆盖 env 的 axis_err success 阈值 (默认 inf = M1' 不检查 axis). "
+                        "M2a 用 0.5, M2b 用 0.2. 接受 'inf' 字符串.")
+    p.add_argument("--load_agent", type=str, default=None,
+                   help="warm-start 路径: 从该 checkpoint 加载 agent (actor/critic/"
+                        "optimizer state). obs 维度必须匹配; 31 维 M1 老 checkpoint "
+                        "不能加载到 32 维 env, 先重训 M1'.")
+    p.add_argument("--keep_replay", action="store_true",
+                   help="warm-start 时保留旧 replay buffer. 默认会清空 — 因为 stage "
+                        "切换 (M1'→M2a, M2a→M2b) reward 函数变了, 旧 transitions 的 "
+                        "reward 标签按旧 reward 算, 留着会拖 critic.")
     p.add_argument("--terminal_hold_bonus", type=float, default=None,
                    help="hold-N 步成功后的终结 bonus + episode 终止. "
                         "0 = 关闭 (baseline). >0 启用 absorbing termination.")
     p.add_argument("--hold_success_steps", type=int, default=10,
                    help="eval success 定义 + env 终止阈值: 连续 N 步都在阈值内. "
-                        "N=10 ≈ 1s hold (per-step dt≈0.1s). "
-                        "若 --terminal_hold_bonus > 0, 这个 N 也是 env absorbing 触发条件.")
+                        "N=10 ≈ 1s hold (per-step dt≈0.1s).")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -113,56 +136,32 @@ def main():
         )
     if args.n_steps_per_fit % args.num_envs != 0:
         raise ValueError(
-            f"n_steps_per_fit ({args.n_steps_per_fit}) 必须能被 num_envs ({args.num_envs}) 整除, "
-            "否则会截断半个 vector-step"
+            f"n_steps_per_fit ({args.n_steps_per_fit}) 必须能被 num_envs ({args.num_envs}) 整除"
         )
     if args.n_steps_per_epoch % args.n_steps_per_fit != 0:
         raise ValueError(
             f"n_steps_per_epoch ({args.n_steps_per_epoch}) 必须能被 "
-            f"n_steps_per_fit ({args.n_steps_per_fit}) 整除, 否则 VectorCore 会在 "
-            "epoch 末尾丢弃未 fit 的残余 transition"
+            f"n_steps_per_fit ({args.n_steps_per_fit}) 整除"
         )
-    # 注: n_steps_per_epoch % num_envs == 0 由上面两条共同蕴含, 不必单独校验
     args.n_eval_episodes = resolve_eval_episode_count(
         args.n_eval_episodes, args.num_envs, "--n_eval_episodes"
     )
 
-    from envs import (
-        DEFAULT_LEFT_CHEST_TARGET,
-        DEFAULT_RIGHT_CHEST_TARGET,
-        DualArmPegHoleEnv,
-    )
+    from envs import DualArmPegHoleEnv
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
-    if (args.left_target is None) != (args.right_target is None):
-        raise ValueError("--left_target 和 --right_target 必须同时提供")
-    if args.left_target is not None and args.target_travel_fraction is not None:
-        raise ValueError("显式 fixed targets 与 --target_travel_fraction 不能同时使用")
-
-    if args.left_target is not None:
-        env_kwargs.update(
-            left_target=tuple(args.left_target),
-            right_target=tuple(args.right_target),
-        )
-    elif args.target_travel_fraction is None:
-        env_kwargs.update(
-            left_target=DEFAULT_LEFT_CHEST_TARGET,
-            right_target=DEFAULT_RIGHT_CHEST_TARGET,
-        )
-    else:
-        env_kwargs["target_travel_fraction"] = args.target_travel_fraction
-    for key in ("initial_joint_noise", "success_pos_threshold", "rew_action",
-                "rew_success", "terminal_hold_bonus"):
+    for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
+                "preinsert_offset", "rew_action", "rew_success", "rew_axis",
+                "success_axis_threshold", "terminal_hold_bonus"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
-    # env 用同一个 hold N 做 absorbing termination + eval metric, 一次性同步
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
 
     # IsaacSim 启动后才能导入 mushroom_rl (避免 carb 冲突)
     from mushroom_rl.algorithms.actor_critic import SAC
-    from mushroom_rl.core import VectorCore, Logger, Dataset
+    from mushroom_rl.core import Agent, VectorCore, Logger, Dataset
 
     obs_dim = mdp.info.observation_space.shape[0]
     act_dim = mdp.info.action_space.shape[0]
@@ -170,44 +169,55 @@ def main():
     if target_entropy is None:
         target_entropy = -float(act_dim)
 
-    # baseline 不做 obs 归一化, 网络默认不注册 _obs_scale buffer (forward 里 hasattr fallback).
-    # 后续若要开归一化, 在这里加 `obs_scale=mdp.get_obs_scale().detach().cpu().tolist()`.
-    actor_params = dict(network=ActorNetwork, input_shape=(obs_dim,),
-                        output_shape=(act_dim,))
-    actor_optimizer = {"class": optim.Adam, "params": {"lr": args.lr_actor}}
-    critic_params = dict(network=CriticNetwork, input_shape=(obs_dim,),
-                         output_shape=(1,), action_dim=act_dim,
-                         optimizer={"class": optim.Adam, "params": {"lr": args.lr_critic}},
-                         loss=F.mse_loss)
+    if args.load_agent is not None:
+        # Warm-start: 加载已有 agent 的 actor/critic/optimizer (+ replay buffer).
+        # obs 维度必须匹配 (32 维); 加载 31 维老 checkpoint 会在 forward 时抛 shape 错.
+        load_path = Path(args.load_agent)
+        if not load_path.is_file():
+            raise FileNotFoundError(f"--load_agent 路径不存在: {load_path}")
+        agent = Agent.load(str(load_path))
+        print(f"[WARM-START] 已加载 agent from {load_path}")
+        # 默认清空 replay buffer: stage 切换 (M1'→M2a, M2a→M2b) reward 函数变了,
+        # 旧 transitions 的 reward 标签按旧 reward 算的, 留下来会拖 critic. 仅在
+        # 用户显式 --keep_replay 时保留.
+        if not args.keep_replay:
+            agent._replay_memory.reset()
+            print("[WARM-START] replay buffer 已清空 — 重新走 INITIAL_REPLAY_SIZE 填充. "
+                  "若要保留旧 buffer, 加 --keep_replay.")
+        else:
+            print("[WARM-START] 保留旧 replay buffer (--keep_replay).")
+    else:
+        actor_params = dict(network=ActorNetwork, input_shape=(obs_dim,),
+                            output_shape=(act_dim,))
+        actor_optimizer = {"class": optim.Adam, "params": {"lr": args.lr_actor}}
+        critic_params = dict(network=CriticNetwork, input_shape=(obs_dim,),
+                             output_shape=(1,), action_dim=act_dim,
+                             optimizer={"class": optim.Adam, "params": {"lr": args.lr_critic}},
+                             loss=F.mse_loss)
 
-    agent = SAC(
-        mdp_info=mdp.info,
-        actor_mu_params=actor_params,
-        actor_sigma_params=actor_params,
-        actor_optimizer=actor_optimizer,
-        critic_params=critic_params,
-        batch_size=BATCH_SIZE,
-        initial_replay_size=INITIAL_REPLAY_SIZE,
-        max_replay_size=MAX_REPLAY_SIZE,
-        warmup_transitions=INITIAL_REPLAY_SIZE,
-        tau=0.005,
-        lr_alpha=args.lr_alpha,
-        use_log_alpha_loss=True,  # 原论文形式, 对 α 爆炸更稳
-        target_entropy=target_entropy,
-    )
+        agent = SAC(
+            mdp_info=mdp.info,
+            actor_mu_params=actor_params,
+            actor_sigma_params=actor_params,
+            actor_optimizer=actor_optimizer,
+            critic_params=critic_params,
+            batch_size=BATCH_SIZE,
+            initial_replay_size=INITIAL_REPLAY_SIZE,
+            max_replay_size=MAX_REPLAY_SIZE,
+            warmup_transitions=INITIAL_REPLAY_SIZE,
+            tau=0.005,
+            lr_alpha=args.lr_alpha,
+            use_log_alpha_loss=True,
+            target_entropy=target_entropy,
+        )
     def clamp_alpha(_dataset=None):
         with torch.no_grad():
             agent._log_alpha.clamp_(max=math.log(args.alpha_max))
 
-    # 注: mushroom 的 StandardizationPreprocessor 对 vectorized env 有 bug
-    # (Welford batch 更新把整 batch 当一样本, std 随训练趋于 0, obs 被 clip 成 ±10 垃圾).
-    # 暂不使用任何 preprocessor, 直接喂 raw obs.
     core = VectorCore(agent, mdp, callbacks_fit=[clamp_alpha])
 
     results_dir = PROJECT_ROOT / "results"
     results_dir.mkdir(exist_ok=True)
-    # 杜绝 stale checkpoint: 上一 run 的 best_agent.msh 留下来会让人误以为本次的
-    # best 在那里. best_score gate (>0 才存) 在全程没成功时不会保存, 必须先删.
     best_path = results_dir / "best_agent.msh"
     if best_path.exists():
         best_path.unlink()
@@ -216,6 +226,12 @@ def main():
     logger.info(f"清理旧 best checkpoint (本次 run 自建): {best_path}")
     logger.info(f"obs_dim={obs_dim}  act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
+    logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
+                f"axis_th={mdp._success_axis_threshold:.3f}  "
+                f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
+                f"preinsert_offset={mdp._preinsert_offset:.3f}m")
+    if args.load_agent is not None:
+        logger.info(f"warm-start: {args.load_agent}")
     logger.info(f"target_entropy={target_entropy:.3f}  "
                 f"lr_actor={args.lr_actor:.1e}  lr_critic={args.lr_critic:.1e}  "
                 f"lr_alpha={args.lr_alpha:.1e}  alpha_max={args.alpha_max:.3f}")
@@ -225,12 +241,14 @@ def main():
 
     mask = torch.ones(args.num_envs, dtype=torch.bool, device=mdp._device)
     obs, _ = mdp.reset_all(mask)
-    left_pos_err, right_pos_err, in_thresh_mask = mdp._compute_task_errors(obs)
-    in_thresh_rate = float(in_thresh_mask.float().mean())
+    pos_err, axis_err, in_thresh_mask = mdp._compute_task_errors(obs)
     logger.info("reset stats: "
-                f"in_thresh_rate={in_thresh_rate:.3f}  "
-                f"left_pos_err_mean={float(left_pos_err.mean()):.4f}m  "
-                f"right_pos_err_mean={float(right_pos_err.mean()):.4f}m")
+                f"in_thresh_rate={float(in_thresh_mask.float().mean()):.3f}  "
+                f"pos_err_mean={float(pos_err.mean()):.4f}m  "
+                f"pos_err_min={float(pos_err.min()):.4f}m  "
+                f"pos_err_max={float(pos_err.max()):.4f}m  "
+                f"axis_err_mean={float(axis_err.mean()):.4f}  "
+                f"axis_err_max={float(axis_err.max()):.4f}")
 
     wandb_run = None
     if not args.no_wandb:
@@ -245,8 +263,6 @@ def main():
         )
         logger.info(f"wandb run: {wandb_run.url}")
 
-    # 空 dataset 用来做额外 gradient step: SAC.fit 里 replay.add(empty) 是 no-op,
-    # 但 sample + update 照跑. 分配一次复用.
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
 
     warmup_vector_steps = math.ceil(INITIAL_REPLAY_SIZE / args.num_envs)
@@ -267,16 +283,10 @@ def main():
                 f"vector-steps/epoch≈{vector_steps_per_epoch:.1f}")
 
     best_J = -np.inf
-    # best 选择策略两选一:
-    # - terminal_hold_bonus > 0 (absorbing 启用): 用 best_J, 因为 J 直接包含 terminal bonus
-    #   信号, 量级压过 drift-out 噪声; 而 hold_success_rate × max_hold_mean 会被 hold-N
-    #   的 absorbing 钉住 (max_hold 上限 = N), 一旦 sr=1.0 就封顶, 后续更优策略存不下.
-    # - terminal_hold_bonus = 0 (baseline): 用 best_score, 因为长 horizon 下 J 受
-    #   drift-out 噪声污染, 跨 epoch 比较不稳.
     best_score = -np.inf
     use_J_for_best = mdp._terminal_hold_bonus > 0
     total_env_steps = INITIAL_REPLAY_SIZE
-    absorb_prev = mdp._absorb_count  # warmup 期间的碰撞从 epoch 计数中扣除
+    absorb_prev = mdp._absorb_count
     for epoch in range(args.n_epochs):
         core.learn(
             n_steps=args.n_steps_per_epoch,
@@ -289,7 +299,6 @@ def main():
             clamp_alpha()
         total_env_steps += args.n_steps_per_epoch
 
-        # 在 evaluate 之前快照, 只计训练期间的碰撞 (eval 碰撞不算本 epoch)
         absorb_epoch = mdp._absorb_count - absorb_prev
 
         with deterministic_policy(agent):
@@ -306,12 +315,16 @@ def main():
         improved_score = m['hold_success_rate'] > 0 and score > best_score
         if improved_score:
             best_score = score
-        # 选 best: 见上面 use_J_for_best 注释
-        save_now = improved_J if use_J_for_best else improved_score
+        # M1 初期可能长期没有 hold success, 但 dense pos_err reward 已经在改善.
+        # 在 best_score 还没变成有限值前, 先按 best_J 保存, 避免短跑/早期实验没有
+        # best_agent.msh 可供 visualize/eval 使用; 一旦出现 hold success, 继续回到
+        # hold-score 作为 baseline 的 best 选择标准.
+        save_now = improved_J if use_J_for_best else (
+            improved_score or (best_score == -np.inf and improved_J)
+        )
         if save_now:
             agent.save(str(results_dir / "best_agent.msh"))
 
-        # 下一 epoch 的 train 计数从 eval 结束后开始 (丢弃 eval 期间的碰撞)
         absorb_prev = mdp._absorb_count
 
         logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J, best_score=best_score,
@@ -322,8 +335,8 @@ def main():
                     f"max_hold_mean={m['max_hold_mean']:.1f}  "
                     f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
                     f"final_in_thresh_rate={m['final_in_thresh_rate']:.3f}  "
-                    f"left_err_mean={m['left_pos_err_mean']:.4f}m  "
-                    f"right_err_mean={m['right_pos_err_mean']:.4f}m")
+                    f"pos_err_mean={m['pos_err_mean']:.4f}m  "
+                    f"axis_err_mean={m['axis_err_mean']:.4f}")
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
@@ -333,8 +346,8 @@ def main():
                 "eval_max_hold_mean": m["max_hold_mean"],
                 "eval_in_thresh_rate": m["in_thresh_rate"],
                 "eval_final_in_thresh_rate": m["final_in_thresh_rate"],
-                "eval_left_pos_err_mean": m["left_pos_err_mean"],
-                "eval_right_pos_err_mean": m["right_pos_err_mean"],
+                "eval_pos_err_mean": m["pos_err_mean"],
+                "eval_axis_err_mean": m["axis_err_mean"],
                 "alpha": agent._alpha.item(),
                 "absorb_per_epoch": absorb_epoch,
             }, step=epoch + 1)

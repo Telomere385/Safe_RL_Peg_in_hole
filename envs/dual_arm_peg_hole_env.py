@@ -1,48 +1,59 @@
-"""双臂末端"位置到达"任务 (phase 1) — mushroom-rl IsaacSim 向量化环境.
+"""双臂 peg-in-hole preinsert 任务 — mushroom-rl IsaacSim 向量化环境.
 
-phase 1 目标: 左右末端各自到达固定在 world frame 的绝对位置目标. 不涉及任何
-姿态控制, 不涉及 peg/hole 几何. 长期目标 (peg-in-hole 装配) 在后续 phase 引入.
+阶段 (stage flag 化, 同一个 env / 同一个 obs / 同一条 reward 骨架):
+    M1' = pos-only           rew_axis=0,    success_axis_threshold=inf
+    M2a = pos + 粗轴对齐      rew_axis=1.0,  success_axis_threshold=0.5
+    M2b = pos + 紧轴对齐      rew_axis=1.0,  success_axis_threshold=0.2
+    M3+ = 在 obs 里再加
+          radial/axial 维度 (留给后续 commit, 此版本不放).
+
+切换 stage 不改 env 结构, 只改 reward 权重和 success_axis_threshold. 这样
+M1' → M2a → M2b 之间可以 warm-start (--load_agent), 网络输入维度恒为 32.
 
 每臂控全部 7 DoF (A1-A7), 14 维 joint velocity 动作.
 
-观测 (40 维):
+观测 (32 维):
     joint_pos          (14) 左右臂 A1-A7 关节角
     joint_vel          (14) 左右臂 A1-A7 关节角速度
-    left_ee_pos        (3)  左末端位置 (env-local)
-    right_ee_pos       (3)  右末端位置 (env-local)
-    left_rel_goal_pos  (3)  T_L - left_ee
-    right_rel_goal_pos (3)  T_R - right_ee
+    pos_vec            (3)  peg_tip - preinsert_target
+    axis_dot           (1)  dot(peg_axis, hole_axis) ∈ [-1, +1]
+                            -1 = 完美轴反平行 (理想对齐).
+                            放标量 (而非完整 peg_axis/hole_axis 6 维): 一维已经
+                            把"对齐到什么程度"的梯度信号给出来; 完整向量与 EE
+                            quat 强冗余, 徒增维度.
 
 动作 (14):
     action ∈ [-1,1]^14 → joint velocity 指令 (rad/s), 系数 action_scale.
 
-Reward:
-    - w_pos * (||left_ee - T_L|| + ||right_ee - T_R||)
+Reward (统一骨架):
+    - w_pos     * pos_err                             # ||peg_tip - preinsert_target||
+    - w_axis    * axis_err                            # 1 + dot(peg_axis, hole_axis), 0 = ideal
     - w_joint_limit * joint_limit_norm
-    - w_action * sum(a_i^2)                 # raw action, 解耦 action_scale
-    + w_success * 1[||·||_L < pos_th ∧ ||·||_R < pos_th]
-
-Target 生成 (在 __init__ 末尾 eager-init 一次冻结, 固定在 world frame):
-    - 默认使用对称的前下方固定目标点:
-      T_L = [-0.80, -0.40, 0.62]
-      T_R = [-0.80,  0.40, 0.62]
-    - 若未显式给 fixed target, 则回退到 fraction 模式:
-      left_default, right_default = env-平均的 default EE 位置
-      center = (left_default + right_default) / 2
-      T_L = left_default  + f · (center - left_default)
-      T_R = right_default + f · (center - right_default)
-      f = target_travel_fraction ∈ [0, 1]; 0 = 原地, 1 = 中点.
+    - w_action  * sum(a_i^2)                          # raw action, 解耦 action_scale
+    + w_success * 1[success]                          # per-step dwell bonus, 不终止
+    success = (pos_err < pos_th) ∧ (axis_err < axis_th)
+              # axis_th=inf 时退化为 pos-only — 这就是 M1' 的语义
 
 终止:
-    - 碰撞 (左右臂接触力 > 阈值): 吸收 r = r_min / (1 - γ)
-    - 成功 不终止: w_success 变成每步 dwell bonus, optimal policy 会学成
-      "reach → hold", 而非 "蹭进阈值立刻终止跑路" 的 boundary-hugging 策略.
+    - 自碰撞 (左右臂接触力 > 阈值): 吸收 r = r_min / (1 - γ)
+    - hold-N (success 连续 N 步): 软 absorbing + terminal_hold_bonus (可选, =0 关闭)
+    - success 本身不终止 (沿用 phase 1 结论, 避免 Q-target 边界断崖, 见
+      feedback_bimanual_reward_shaping.md Rule 1)
 
-Eager-init 后在 env 0 旁边 spawn 红绿可视化球作为目标位置 marker.
+PEG/HOLE 几何 — 解析式 frame (不依赖 XFormPrim):
+    peg/hole 是视觉-only 的 USD over, 挂在左/右 EE 下, 没有 RigidBodyAPI /
+    MassAPI / CollisionAPI (build_peghole_usd.py 验证). 它们的 pose 完全由
+    EE link 的世界位姿 + 一个常量本地偏移决定:
+        peg_tip_world  = LeftEE_pos  + R(LeftEE_quat)  · PEG_TIP_OFFSET_IN_LEFTEE
+        peg_axis_world =                R(LeftEE_quat)  · PEG_AXIS_IN_LEFTEE
+        hole_entry / hole_axis 同理 (RightEE).
+    所以训练 headless 下完全不需要 XFormPrim/Fabric flush — 只要 BODY_POS +
+    BODY_ROT 是 fresh 的, 帧就是对的. visualize_* 也走同一条解析路径,
+    XFormPrim 不再使用.
 """
 
+import math
 from pathlib import Path
-import re
 
 import torch
 
@@ -52,9 +63,6 @@ from mushroom_rl.rl_utils.spaces import Box
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-# Phase 1.5 commit 2: 默认切到带 peg/hole 视觉资产的 composed USDA.
-# Check A 已验证过两份 USD 在 articulation 层是物理 no-op, 所以现有
-# phase 1 训练 checkpoint 在这里仍然可以 1:1 复用.
 DEFAULT_USD_PATH = (
     PROJECT_ROOT / "assets" / "usd" / "dual_arm_iiwa" / "dual_arm_iiwa_with_peghole.usda"
 )
@@ -73,14 +81,49 @@ RIGHT_EE_PATH = "/right_hande_robotiq_hande_link"
 LEFT_ARM_GROUP = LEFT_ARM_LINKS + [LEFT_EE_PATH]
 RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 
-DEFAULT_LEFT_CHEST_TARGET = (-0.80, -0.40, 0.62)
-DEFAULT_RIGHT_CHEST_TARGET = (-0.80, 0.40, 0.62)
+# Peg/Hole 几何与挂载常量 — 必须与 build_peghole_usd.py 保持一致.
+# 推导 (USD 应用顺序: orient 后 translate, 见 build script:
+#   xformOpOrder = ["xformOp:translate", "xformOp:orient"]):
+#   Peg/Hole 在 EE 帧里 = T(PART_X, 0, PART_Z) ∘ R_x(+90°)
+#   peg_tip 在 Peg 局部为 (0, 0, +PEG_HEIGHT/2)
+#   hole_entry 在 Hole 局部为 (0, 0, +HOLE_HEIGHT/2)
+# 所以 peg_tip 在 LeftEE 帧:  R_x(+90°)·(0,0,h/2) + (PART_X, 0, PART_Z)
+#                          = (PART_X, -h/2, PART_Z)
+_PART_X = -0.0055
+_PART_Z = 0.125
+_PEG_HEIGHT = 0.035
+_HOLE_HEIGHT = 0.030
+_PEG_TIP_LOCAL_Z = 0.5 * _PEG_HEIGHT       # 0.0175
+_HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.015
 
-# 相对 peg_tip / hole_entry prim 的稳定路径后缀. 找 cloned env 里对应 prim 用.
-PEG_TIP_SUFFIX = "left_hande_robotiq_hande_link/Peg/peg_tip"
-HOLE_ENTRY_SUFFIX = "right_hande_robotiq_hande_link/Hole/hole_entry"
+PEG_TIP_OFFSET_IN_LEFTEE = (_PART_X, -_PEG_TIP_LOCAL_Z, _PART_Z)
+HOLE_ENTRY_OFFSET_IN_RIGHTEE = (_PART_X, -_HOLE_ENTRY_LOCAL_Z, _PART_Z)
 
-# 预插入站位: hole_entry 沿 hole_axis 方向后退 preinsert_offset 距离. 默认 5cm.
+# peg_axis: 沿用旧 XFormPrim 实现的 sign convention (peg_tip_quat * R_x(180°) 后
+# apply 到 +Z), 等价于 R(LeftEE_quat) · (0, +1, 0). 这样 axis_err = 1+dot 的
+# 0 = ideal-alignment 语义在新旧实现间一致, 避免 phase 1.5 visualize 验收过的
+# preinsert_target / dot 数值因为符号约定突变.
+PEG_AXIS_IN_LEFTEE = (0.0, +1.0, 0.0)
+# hole_axis: 直接 R(RightEE_quat) · (0,0,1) 经 R_x(+90°) = (0, -1, 0).
+HOLE_AXIS_IN_RIGHTEE = (0.0, -1.0, 0.0)
+
+# peg_axis_quat / hole_axis_quat — 给 visualize_targets 的箭头 orient 用.
+# peg_axis_quat = LeftEE_quat ∘ R_x(+90°) ∘ R_x(180°) = LeftEE_quat ∘ R_x(+270°)
+# R_x(270°) 的 wxyz quat: (cos 135°, sin 135°, 0, 0) = (-√2/2, +√2/2, 0, 0)
+_C45 = math.cos(math.pi / 4)
+_S45 = math.sin(math.pi / 4)
+PEG_AXIS_QUAT_OFFSET = (-_S45, _C45, 0.0, 0.0)   # R_x(270°), 沿用旧 flip 约定
+HOLE_AXIS_QUAT_OFFSET = (_C45, _S45, 0.0, 0.0)   # R_x(+90°), 无 flip
+
+# Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper
+# (obs_helper 的 idx_map 对应 raw obs 而非 agent obs).
+# 32 维布局对所有 stage (M1' / M2a / M2b) 通用; M3+ 才会再加 radial/axial 维度.
+_AGENT_OBS_JOINT_POS = slice(0, 14)
+_AGENT_OBS_JOINT_VEL = slice(14, 28)
+_AGENT_OBS_POS_VEC = slice(28, 31)
+_AGENT_OBS_AXIS_DOT = slice(31, 32)
+AGENT_OBS_DIM = 32
+
 DEFAULT_PREINSERT_OFFSET = 0.05
 
 
@@ -98,17 +141,15 @@ class DualArmPegHoleEnv(IsaacSim):
         reward_absorbing_r_min=-2.0,
         reward_scale=1.0,
         rew_pos=1.0,
+        rew_axis=0.0,
         rew_success=2.0,
         rew_joint_limit=0.02,
         rew_action=0.005,
-        rew_inthresh_vel=0.0,
         success_hold_steps=10,
         terminal_hold_bonus=0.0,
-        success_pos_threshold=0.075,
+        preinsert_success_pos_threshold=0.10,
+        success_axis_threshold=float("inf"),
         joint_limit_margin_frac=0.8,
-        target_travel_fraction=0.5,
-        left_target=DEFAULT_LEFT_CHEST_TARGET,
-        right_target=DEFAULT_RIGHT_CHEST_TARGET,
         preinsert_offset=DEFAULT_PREINSERT_OFFSET,
         usd_path=None,
     ):
@@ -118,51 +159,49 @@ class DualArmPegHoleEnv(IsaacSim):
         self._r_min = reward_absorbing_r_min
         self._reward_scale = reward_scale
         self._w_pos = rew_pos
+        # rew_axis 默认 0 = M1' 行为 (axis 项消失). M2a/M2b 通过 CLI 打开.
+        self._w_axis = rew_axis
         self._w_success = rew_success
         self._w_joint_limit = rew_joint_limit
         self._w_action = rew_action
-        # 阈值内的关节速度惩罚: 杀死 "到达后立刻飘走" 的 drift-out 行为. 0 = 关闭.
-        self._w_inthresh_vel = rew_inthresh_vel
-        # hold-N absorbing 设计: 连续 N 步在阈内即触发 episode 终止 + terminal bonus.
-        # terminal_hold_bonus=0 时整个机制关闭 (Step 2 baseline 行为).
-        # bonus 量级估算: ≥ b × (1-γ^(H-N))/(1-γ) × 安全余量, b=per-step success bonus.
-        # 例 (b=0.5, γ=0.99, H=150, N=10): 公式 ≈ 50, 取 150 给 3× 余量.
+        # hold-N absorbing 设计 (沿用 phase 1): 连续 N 步在阈内即终止 + bonus.
+        # bonus=0 时整个机制关闭 (baseline 行为).
         self._success_hold_steps = int(success_hold_steps)
         self._terminal_hold_bonus = float(terminal_hold_bonus)
         self._absorbing_terminal_active = self._terminal_hold_bonus > 0.0
-        self._success_pos_threshold = success_pos_threshold
+        self._preinsert_success_pos_threshold = float(preinsert_success_pos_threshold)
+        # success_axis_threshold 默认 inf = success 不检查 axis (M1' 行为).
+        # M2 时通过 CLI 设成 0.5 / 0.2. 用 inf 而不是 None 让 success_mask 表达式
+        # 不需要 None-check 分支, 永远是干净的 (pos<pos_th) & (axis_err<axis_th).
+        self._success_axis_threshold = float(success_axis_threshold)
         self._joint_limit_margin_frac = joint_limit_margin_frac
-        self._target_travel_fraction = target_travel_fraction
-        self._fixed_left_target = left_target
-        self._fixed_right_target = right_target
         self._preinsert_offset = float(preinsert_offset)
         self._usd_path = Path(usd_path) if usd_path is not None else DEFAULT_USD_PATH
         if not self._usd_path.is_file():
             raise FileNotFoundError(
                 "找不到机器人 USD 资产文件: "
                 f"{self._usd_path}\n"
-                "请确认仓库内存在 assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd，"
+                "请确认仓库内存在 assets/usd/dual_arm_iiwa/dual_arm_iiwa_with_peghole.usda，"
                 "或在构造 DualArmPegHoleEnv 时显式传入 usd_path。"
             )
-        self._left_target = None
-        self._right_target = None
-        # is_absorbing 与 reward 在同一 next_obs 上背靠背调用, 缓存避免重复计算
+
+        # is_absorbing 与 reward 在同一 next_obs 上背靠背调用, 缓存避免重复计算.
+        # _create_observation 每步会刷新这些 cache.
         self._last_collision_mask = None
-        self._last_task_errors = None
+        self._last_pos_err = None
+        self._last_axis_err = None
+        self._last_success_mask = None
         # _preprocess_action → reward 链路里缓存 pre-scale 的 raw action,
-        # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦, 改 action_scale 时
-        # 惩罚强度语义不变.
+        # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦.
         self._last_raw_action = None
-        # _view 由 peg/hole prim 发现块按需赋值; 老 USD 没 peg/hole 就保持 None,
-        # get_preinsert_frames() 据此返回 None.
-        self._peg_tip_view = None
-        self._hole_entry_view = None
 
         observation_spec = [
             ("joint_pos", "", ObservationType.JOINT_POS, ARM_JOINTS),
             ("joint_vel", "", ObservationType.JOINT_VEL, ARM_JOINTS),
             ("left_ee_pos", LEFT_EE_PATH, ObservationType.BODY_POS, None),
             ("right_ee_pos", RIGHT_EE_PATH, ObservationType.BODY_POS, None),
+            ("left_ee_rot", LEFT_EE_PATH, ObservationType.BODY_ROT, None),
+            ("right_ee_rot", RIGHT_EE_PATH, ObservationType.BODY_ROT, None),
         ]
         collision_groups = [("arm_L", LEFT_ARM_GROUP), ("arm_R", RIGHT_ARM_GROUP)]
 
@@ -182,7 +221,6 @@ class DualArmPegHoleEnv(IsaacSim):
             action_type=ActionType.VELOCITY,
             collision_groups=collision_groups,
             headless=headless,
-            # 多 env 默认相机站在群中心, 画面混乱; 拉远到群外上方俯瞰整网格.
             camera_position=(20, -15, 10),
             camera_target=(5, 0, 0.5),
         )
@@ -196,7 +234,7 @@ class DualArmPegHoleEnv(IsaacSim):
 
         # USD iiwa 默认 position-drive (kp ~ 5e5); velocity 控制必须把 kp 置 0,
         # 否则 reset 里 set_joint_positions 会一并写 pos_target, 高 kp 把关节钉
-        # 回 reset 点, velocity 指令完全推不动.
+        # 回 reset 点.
         robots = self._task.robots
         cj = self._task._controlled_joints
         zero_kps = torch.zeros(self._n_envs, len(ARM_JOINTS), device=device)
@@ -205,58 +243,38 @@ class DualArmPegHoleEnv(IsaacSim):
         self._cj = cj
         self._robots = robots
 
-        # 累计碰撞终止次数 (train_sac 每 epoch 读取 + 上一 epoch 值做差分 → 本 epoch 新增).
+        # 累计自碰撞终止次数 (train_sac 每 epoch 读取并差分)
         self._absorb_count = 0
 
-        # hold-N 计数器 (per env). 每个 env 一个 long, success_mask=True 累加, False 清零.
-        # is_absorbing 里更新, reward 里读 cache (_last_hold_done_mask).
-        # setup() 在 episode reset 时把对应 env 的 counter 清零.
+        # hold-N 计数器 (per env)
         self._consecutive_inthresh = torch.zeros(
             self._n_envs, dtype=torch.long, device=self._device
         )
         self._last_hold_done_mask = None
 
-        # Eager-init targets 在所有 step_all/teleport_away 之前: super().__init__()
-        # 已经跑过 self._world.reset(), 16 个 env 的 robot 都在 USD default pose
-        # (EE 在 world z≈0.73). 读一次 fresh obs 冻结绝对目标, 之后完全免疫
-        # teleport_away 污染 (n_episodes < num_envs 时 inactive env 会被抬到 z=50).
-        # 读 obs 前先 step 一次: BODY_POS view 在 _world.reset() 后未必同步物理状态.
-        self._world.step(render=False)
-        init_obs = self.observation_helper.build_obs(self._task.get_observations(clone=True))
-        self._init_targets(
-            self.observation_helper.get_from_obs(init_obs, "left_ee_pos"),
-            self.observation_helper.get_from_obs(init_obs, "right_ee_pos"),
+        # 解析式 frame 用的常量 (LeftEE 局部坐标), 一次 build, broadcast 用
+        dtype = self._joint_lower.dtype
+        dev = self._device
+        self._peg_tip_offset = torch.tensor(PEG_TIP_OFFSET_IN_LEFTEE, device=dev, dtype=dtype)
+        self._hole_entry_offset = torch.tensor(HOLE_ENTRY_OFFSET_IN_RIGHTEE, device=dev, dtype=dtype)
+        self._peg_axis_local = torch.tensor(PEG_AXIS_IN_LEFTEE, device=dev, dtype=dtype)
+        self._hole_axis_local = torch.tensor(HOLE_AXIS_IN_RIGHTEE, device=dev, dtype=dtype)
+        self._peg_axis_quat_offset = torch.tensor(
+            PEG_AXIS_QUAT_OFFSET, device=dev, dtype=dtype
         )
-        self._spawn_target_markers()
+        self._hole_axis_quat_offset = torch.tensor(
+            HOLE_AXIS_QUAT_OFFSET, device=dev, dtype=dtype
+        )
 
-        # Phase 1.5 commit 2: 发现 peg/hole 的 cloned prim 路径.
-        # 如果加载的是老 USD (无 peg/hole), 两个列表会是空的, get_preinsert_frames()
-        # 会返回 None. 这时候旧流程 (reaching reward/obs) 不受影响.
-        self._peg_tip_paths = self._find_cloned_prim_paths(PEG_TIP_SUFFIX)
-        self._hole_entry_paths = self._find_cloned_prim_paths(HOLE_ENTRY_SUFFIX)
-        if self._peg_tip_paths and self._hole_entry_paths:
-            from isaacsim.core.prims import XFormPrim
+        # peg/hole 资产存在性 fail-fast 检查 (phase 1.5 commit 2 的 print 降级删除)
+        self._verify_peghole_prims_exist()
 
-            self._peg_tip_view = XFormPrim(
-                self._peg_tip_paths, name="peg_tip_frame_view", reset_xform_properties=False, usd=False
-            )
-            self._hole_entry_view = XFormPrim(
-                self._hole_entry_paths, name="hole_entry_frame_view", reset_xform_properties=False, usd=False
-            )
-            self._peg_tip_view.initialize()
-            self._hole_entry_view.initialize()
-            print(
-                f"[PREINSERT] peg/hole 视觉资产已加载, "
-                f"cloned 实例数: peg_tip={len(self._peg_tip_paths)}, "
-                f"hole_entry={len(self._hole_entry_paths)}"
-            )
-        else:
-            print(
-                "[PREINSERT] 注意: stage 里没找到 peg_tip / hole_entry prim. "
-                "get_preinsert_frames() 将返回 None. 若不是故意加载无-peghole USD, "
-                "请确认 --usd 或 DEFAULT_USD_PATH 指向 dual_arm_iiwa_with_peghole.usda"
-            )
+        # 同步一次物理状态, 避免 reset_all 后第一帧 BODY_POS / BODY_ROT 是 stale
+        self._world.step(render=False)
 
+    # ------------------------------------------------------------------
+    # mushroom hooks
+    # ------------------------------------------------------------------
     def _modify_mdp_info(self, mdp_info):
         # action: [-1,1]^14, SAC tanh policy 直接映射
         device = mdp_info.action_space.low.device
@@ -264,13 +282,24 @@ class DualArmPegHoleEnv(IsaacSim):
         one = torch.ones(len(ARM_JOINTS), device=device, dtype=dtype)
         mdp_info.action_space = Box(-one, one, data_type=dtype)
 
-        # observation: 在 raw 34 dim 之外追加 6 dim 相对目标位置
-        obs_low, obs_high = self.observation_helper.obs_limits
-        goal_low = torch.full((6,), -5.0, device=obs_low.device, dtype=obs_low.dtype)
-        goal_high = torch.full((6,), 5.0, device=obs_high.device, dtype=obs_high.dtype)
-        new_obs_low = torch.cat([obs_low, goal_low], dim=0)
-        new_obs_high = torch.cat([obs_high, goal_high], dim=0)
-        mdp_info.observation_space = Box(new_obs_low, new_obs_high, data_type=new_obs_high.dtype)
+        # observation: 32 维 agent obs (见模块 docstring + _AGENT_OBS_* 切片).
+        # 不能用 self._joint_lower / _joint_upper 在这里取 — 它们在 super().__init__
+        # 之后才赋值, 而 mushroom 在 super 里就调本函数. obs_helper 已经构造完毕,
+        # 走它的 obs_limits + obs_idx_map 切出 joint 段.
+        raw_low, raw_high = self.observation_helper.obs_limits
+        jp_idx = self.observation_helper.obs_idx_map["joint_pos"]
+        jv_idx = self.observation_helper.obs_idx_map["joint_vel"]
+        jp_low = raw_low[jp_idx].to(dtype)
+        jp_high = raw_high[jp_idx].to(dtype)
+        jv_low = raw_low[jv_idx].to(dtype)
+        jv_high = raw_high[jv_idx].to(dtype)
+        pos_lo = torch.full((3,), -5.0, device=jp_low.device, dtype=dtype)
+        pos_hi = torch.full((3,), 5.0, device=jp_low.device, dtype=dtype)
+        axis_lo = torch.full((1,), -1.0, device=jp_low.device, dtype=dtype)
+        axis_hi = torch.full((1,), 1.0, device=jp_low.device, dtype=dtype)
+        new_obs_low = torch.cat([jp_low, jv_low, pos_lo, axis_lo], dim=0)
+        new_obs_high = torch.cat([jp_high, jv_high, pos_hi, axis_hi], dim=0)
+        mdp_info.observation_space = Box(new_obs_low, new_obs_high, data_type=dtype)
         return mdp_info
 
     def _preprocess_action(self, action):
@@ -280,83 +309,63 @@ class DualArmPegHoleEnv(IsaacSim):
         return clipped * self._action_scale
 
     def _create_observation(self, obs):
+        """raw obs (42 dim) → agent obs (32 dim).
+
+        raw 布局 (与 observation_spec 顺序一致):
+            joint_pos[14] joint_vel[14] left_ee_pos[3] right_ee_pos[3]
+            left_ee_rot[4] right_ee_rot[4]
+        agent obs 布局 (见 _AGENT_OBS_* 切片):
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]
+        """
+        joint_pos = self.observation_helper.get_from_obs(obs, "joint_pos")
+        joint_vel = self.observation_helper.get_from_obs(obs, "joint_vel")
         left_ee = self.observation_helper.get_from_obs(obs, "left_ee_pos")
         right_ee = self.observation_helper.get_from_obs(obs, "right_ee_pos")
-        left_rel = self._left_target.unsqueeze(0) - left_ee
-        right_rel = self._right_target.unsqueeze(0) - right_ee
-        return torch.cat([obs, left_rel, right_rel], dim=-1)
+        left_quat = self.observation_helper.get_from_obs(obs, "left_ee_rot")
+        right_quat = self.observation_helper.get_from_obs(obs, "right_ee_rot")
 
-    def _init_targets(self, left_ee, right_ee):
-        """优先使用固定胸前目标; 否则从 env-平均 default EE 位置 + fraction 冻结目标."""
-        if (self._fixed_left_target is None) != (self._fixed_right_target is None):
-            raise ValueError("left_target 和 right_target 必须同时提供或同时为 None")
+        peg_tip = left_ee + self._quat_apply(left_quat, self._peg_tip_offset)
+        hole_entry = right_ee + self._quat_apply(right_quat, self._hole_entry_offset)
+        peg_axis = self._quat_apply(left_quat, self._peg_axis_local)
+        hole_axis = self._quat_apply(right_quat, self._hole_axis_local)
+        peg_axis = peg_axis / peg_axis.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        hole_axis = hole_axis / hole_axis.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        left_default = left_ee.mean(dim=0).detach().clone()
-        right_default = right_ee.mean(dim=0).detach().clone()
+        preinsert_target = hole_entry + self._preinsert_offset * hole_axis
+        pos_vec = peg_tip - preinsert_target
 
-        if self._fixed_left_target is not None:
-            self._left_target = torch.as_tensor(
-                self._fixed_left_target, device=left_default.device, dtype=left_default.dtype
-            ).clone()
-            self._right_target = torch.as_tensor(
-                self._fixed_right_target, device=right_default.device, dtype=right_default.dtype
-            ).clone()
-            print("[TARGETS] fixed symmetric front-low targets\n"
-                  f"  T_L = {self._left_target.tolist()}  (default {left_default.tolist()})\n"
-                  f"  T_R = {self._right_target.tolist()}  (default {right_default.tolist()})")
-            return
+        # axis_dot ∈ [-1, +1], -1 = 完美对齐. axis_err = 1 + axis_dot ∈ [0, 2].
+        axis_dot = (peg_axis * hole_axis).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        axis_err = 1.0 + axis_dot.squeeze(-1)
 
-        center = 0.5 * (left_default + right_default)
-        f = self._target_travel_fraction
-        self._left_target = left_default + f * (center - left_default)
-        self._right_target = right_default + f * (center - right_default)
-        print(f"[TARGETS] fraction={f}\n"
-              f"  T_L = {self._left_target.tolist()}  (default {left_default.tolist()})\n"
-              f"  T_R = {self._right_target.tolist()}  (default {right_default.tolist()})")
+        # cache 给 is_absorbing / reward 复用 (避免再算一遍 quat 旋转).
+        # M3+ 想加 radial_vec / axial_dist 时, 在这里 cache 即可.
+        self._cached_pos_vec = pos_vec
+        self._cached_axis_err = axis_err
 
-    def _spawn_target_markers(self):
-        """env 0 旁 spawn 球形 USD marker. BODY_POS obs 是 env-local, 加回 env 0 world offset."""
-        try:
-            import omni.usd
-            from pxr import UsdGeom, Sdf, Gf, Vt
-        except ImportError:
-            return
-        stage = omni.usd.get_context().get_stage()
-        if stage is None:
-            return
+        return torch.cat([joint_pos, joint_vel, pos_vec, axis_dot], dim=-1)
 
-        try:
-            world_pos_tensor, _ = self._task.robots.get_world_poses()
-            env0 = world_pos_tensor[0].detach().cpu()
-            env0_offset = (float(env0[0]), float(env0[1]), float(env0[2]))
-        except Exception as e:
-            print(f"[VIZ] env 0 offset query 失败 ({e}), marker 放在 world 原点")
-            env0_offset = (0.0, 0.0, 0.0)
-        print(f"[VIZ] env 0 world offset = {env0_offset}")
+    def _compute_task_errors(self, agent_obs):
+        """从 agent obs 切片重建 (pos_err, axis_err, success_mask).
 
-        def add_marker(prefix, pos, color):
-            world_pos = (float(pos[0]) + env0_offset[0],
-                         float(pos[1]) + env0_offset[1],
-                         float(pos[2]) + env0_offset[2])
-            sphere = UsdGeom.Sphere.Define(stage, Sdf.Path(f"{prefix}_sphere"))
-            sphere.GetRadiusAttr().Set(0.03)
-            sphere.GetDisplayColorAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*color)]))
-            xf = UsdGeom.Xformable(sphere.GetPrim())
-            xf.ClearXformOpOrder()
-            xf.AddTranslateOp().Set(Gf.Vec3d(*world_pos))
+        train_sac.py 的 reset stats 和 _eval_utils.compute_hold_metrics 都通过
+        这条接口拉指标; agent obs 已经包含 pos_vec 和 axis_dot, 所以不需要再走
+        _create_observation 重新查 EE pose.
 
-        add_marker("/World/target_L", self._left_target, (1.0, 0.15, 0.15))
-        add_marker("/World/target_R", self._right_target, (0.15, 1.0, 0.15))
-
-    def _compute_task_errors(self, obs):
-        """Returns (left_pos_err, right_pos_err, success_mask). Targets 已冻结."""
-        left_ee = self.observation_helper.get_from_obs(obs, "left_ee_pos")
-        right_ee = self.observation_helper.get_from_obs(obs, "right_ee_pos")
-        left_pos_err = torch.norm(left_ee - self._left_target, dim=-1)
-        right_pos_err = torch.norm(right_ee - self._right_target, dim=-1)
-        success_mask = ((left_pos_err < self._success_pos_threshold)
-                        & (right_pos_err < self._success_pos_threshold))
-        return left_pos_err, right_pos_err, success_mask
+        success 用 stage flag 控制:
+            success_axis_threshold=inf 时 axis 项恒 True, 退化为 pos-only (M1' 行为).
+            success_axis_threshold=0.5/0.2 时变成 pos ∧ axis (M2a/M2b).
+        """
+        pos_vec = agent_obs[..., _AGENT_OBS_POS_VEC]
+        pos_err = torch.norm(pos_vec, dim=-1)
+        # axis_dot 已经在 obs 里 [-1, +1]; axis_err = 1 + axis_dot ∈ [0, 2].
+        axis_dot = agent_obs[..., _AGENT_OBS_AXIS_DOT].squeeze(-1)
+        axis_err = 1.0 + axis_dot
+        success_mask = (
+            (pos_err < self._preinsert_success_pos_threshold)
+            & (axis_err < self._success_axis_threshold)
+        )
+        return pos_err, axis_err, success_mask
 
     def is_absorbing(self, obs):
         collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
@@ -364,18 +373,25 @@ class DualArmPegHoleEnv(IsaacSim):
         self._absorb_count += int(collision.sum().item())
         self._last_collision_mask = collision
 
-        # task errors 算给 reward 用 (dwell bonus + hold-N counter)
-        self._last_task_errors = self._compute_task_errors(obs)
-        _, _, success_mask = self._last_task_errors
+        # _create_observation 已 cache pos_vec / axis_err; 在这里只 compose success.
+        # axis_th=inf (M1') 时 axis 项恒 True, success 退化为 pos-only.
+        pos_err = torch.norm(self._cached_pos_vec, dim=-1)
+        axis_err = self._cached_axis_err
+        success_mask = (
+            (pos_err < self._preinsert_success_pos_threshold)
+            & (axis_err < self._success_axis_threshold)
+        )
+        self._last_pos_err = pos_err
+        self._last_axis_err = axis_err
+        self._last_success_mask = success_mask
 
-        # 更新 per-env 的连续 in-threshold 计数: in 阈值则 +1, 否则清零
+        # 更新 per-env 的连续 in-threshold 计数
         self._consecutive_inthresh = torch.where(
             success_mask,
             self._consecutive_inthresh + 1,
             torch.zeros_like(self._consecutive_inthresh),
         )
 
-        # hold-N absorbing 仅当 terminal_hold_bonus > 0 时启用. baseline (=0) 行为完全保留.
         if self._absorbing_terminal_active:
             hold_done = self._consecutive_inthresh >= self._success_hold_steps
         else:
@@ -385,13 +401,12 @@ class DualArmPegHoleEnv(IsaacSim):
         return collision | hold_done
 
     def reward(self, obs, action, next_obs, absorbing):
-        joint_pos = self.observation_helper.get_from_obs(next_obs, "joint_pos")
-        joint_vel = self.observation_helper.get_from_obs(next_obs, "joint_vel")
-        # is_absorbing 已在同一 next_obs 上算过, 直接复用
-        left_pos_err, right_pos_err, success_mask = self._last_task_errors
-        success = success_mask.to(left_pos_err.dtype)
+        joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
+        pos_err = self._last_pos_err
+        axis_err = self._last_axis_err
+        success = self._last_success_mask.to(pos_err.dtype)
 
-        # 关节极限软惩罚: 超 margin 才计, 单关节撞极限贡献 ~1, 正常区域 0
+        # 关节极限软惩罚: 超 margin 才计
         joint_range = self._joint_upper - self._joint_lower
         joint_center = 0.5 * (self._joint_upper + self._joint_lower)
         excess = torch.clamp(
@@ -402,27 +417,19 @@ class DualArmPegHoleEnv(IsaacSim):
         )
         joint_limit_norm = torch.sum(excess ** 2, dim=-1)
 
-        # action L2: 用 cache 的 raw action (pre-scale), 和 action_scale 解耦
+        # action L2: pre-scale raw action, 与 action_scale 解耦
         action_sq = (self._last_raw_action ** 2).sum(dim=-1)
 
-        # 阈值内的关节速度惩罚: 只在已经 reach 时罚速度, 强迫 agent 学会停下来.
-        # 不在阈值时为 0, 不影响初始 reaching 阶段的探索.
-        joint_vel_sq = (joint_vel ** 2).sum(dim=-1)
-        inthresh_vel_pen = success * joint_vel_sq
-
+        # rew_axis=0 时 axis 项消失, 这就是 M1' 行为. M2 通过 CLI 把它打开.
         normal = (
-            -self._w_pos * (left_pos_err + right_pos_err)
+            -self._w_pos * pos_err
+            - self._w_axis * axis_err
             - self._w_joint_limit * joint_limit_norm
             - self._w_action * action_sq
-            - self._w_inthresh_vel * inthresh_vel_pen
             + self._w_success * success
         )
 
-        # 三路 reward 选择:
-        #   collision  → r_min/(1-γ) (硬 absorbing, 失败终结)
-        #   hold-N done → normal + terminal_hold_bonus (软 absorbing, 成功终结)
-        #   其他       → normal
-        # 嵌套 where 让 collision 优先 (同时为 True 时按 collision 处理).
+        # 三路 reward 选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
             self._last_collision_mask,
@@ -444,65 +451,51 @@ class DualArmPegHoleEnv(IsaacSim):
         self._write_data("joint_pos", joint_pos, env_indices)
         self._write_data("joint_vel", torch.zeros_like(joint_pos), env_indices)
 
-        # 重置正在 reset 的 env 的 hold counter, 避免上一 episode 累计的步数泄漏到下一个
         idx_tensor = torch.as_tensor(env_indices, device=self._device, dtype=torch.long)
         self._consecutive_inthresh[idx_tensor] = 0
 
-        # set_joint_positions 只写 DOF buffer; 不 step 的话 BODY_POS view 还是
-        # reset 前的值, reset_all 读到的 EE 位姿是 stale 的.
+        # set_joint_positions 只写 DOF buffer; 不 step 的话 BODY_POS / BODY_ROT
+        # view 还是 reset 前的值, reset_all 读到的 EE pose 是 stale.
         self._world.step(render=False)
 
     def get_obs_scale(self):
-        """40 维 fixed-divisor 归一化向量, 与 observation_space 一一对应.
-
-        对应顺序 (与 _create_observation 输出一致):
-            joint_pos[14], joint_vel[14], left_ee[3], right_ee[3],
-            left_rel_goal[3], right_rel_goal[3]
+        """32 维 fixed-divisor 归一化向量, 与 agent obs 一一对应.
 
         缩放选择 (大致让每维标准差落到 ~1):
-            joint_pos: 半关节范围 (~1.5-3 rad/joint)
-            joint_vel: 2.0 rad/s (iiwa velocity-mode 典型上限)
-            ee / rel: 1.0 m (机器人 reach + 目标点距离量级)
-
-        网络在 forward 第一行除以这个 scale, env 内部 obs 仍是物理单位 (米/弧度),
-        所以 _compute_task_errors 等内部读 obs 的代码不受影响.
+            joint_pos: 半关节范围
+            joint_vel: 2.0 rad/s
+            pos_vec:   0.3m (preinsert 目标距离量级 ~ <0.5m)
+            axis_dot:  1.0  (本身已经在 [-1, +1], 直接除 1 不变)
         """
         device = self._joint_lower.device
-        dtype = torch.float32  # 网络一律用 float32, 这里直接对齐
+        dtype = torch.float32
         joint_pos_scale = 0.5 * (self._joint_upper - self._joint_lower).to(dtype)
         joint_vel_scale = torch.full_like(joint_pos_scale, 2.0)
-        ee_scale = torch.full((6,), 1.0, device=device, dtype=dtype)
-        rel_scale = torch.full((6,), 1.0, device=device, dtype=dtype)
-        return torch.cat([joint_pos_scale, joint_vel_scale, ee_scale, rel_scale])
+        pos_scale = torch.full((3,), 0.3, device=device, dtype=dtype)
+        axis_scale = torch.full((1,), 1.0, device=device, dtype=dtype)
+        return torch.cat([joint_pos_scale, joint_vel_scale, pos_scale, axis_scale])
 
     def _simulation_pre_step(self):
-        """每 intermediate step 物理前施加重力补偿前馈.
+        """每 intermediate step 前注入重力补偿 effort.
 
-        kp=0 velocity drive 只有阻尼项 (kd·(v_target - v_current)), 对恒定重力
-        干扰是结构性欠阻尼 — zero-action 3s 手臂坠落 ~1m. 真机 iiwa (KUKA Sunrise
-        velocity mode) 底层跑重力补偿; sim 里我们用 get_generalized_gravity_forces()
-        拿到 G(q) 作为前馈 effort. agent 的 velocity action 含义不变, 只是不再需要
-        从零学 G(q) 这个 7-DoF 非线性映射.
+        kp=0 velocity drive 只有阻尼项, 对恒定重力是结构性欠阻尼. 真机 iiwa
+        velocity mode 底层跑重力补偿, sim 里我们用 G(q) 作为前馈 effort,
+        agent 不需要从零学这个 7-DoF 非线性映射.
         """
         tau_g = self._robots.get_generalized_gravity_forces(clone=False)
         self._robots.set_joint_efforts(tau_g[:, self._cj], joint_indices=self._cj)
 
     # ------------------------------------------------------------------
-    # Phase 1.5 commit 2: preinsert pose helpers
+    # 解析式 peg / hole frame helpers
     # ------------------------------------------------------------------
-    # 这一组只暴露"读"接口, 不参与 reward / obs / is_absorbing. 训练语义仍然
-    # 是 phase 1 的 reaching. 任务切换留给 commit 3+.
-
     @staticmethod
     def _quat_apply(q_wxyz, v):
-        """用单位四元数 q (wxyz 约定) 旋转向量 v. 支持广播.
+        """用单位四元数 q (wxyz) 旋转向量 v. 支持 [N,4]×[N,3] 或 [N,4]×[3] 广播.
 
-        Args:
-            q_wxyz: [..., 4]
-            v:      [..., 3]
-        Returns:
-            [..., 3] 旋转后的向量.
+        返回 [N, 3].
         """
+        if v.dim() == 1:
+            v = v.unsqueeze(0).expand(q_wxyz.shape[0], -1)
         w = q_wxyz[..., 0]
         x = q_wxyz[..., 1]
         y = q_wxyz[..., 2]
@@ -510,7 +503,6 @@ class DualArmPegHoleEnv(IsaacSim):
         vx = v[..., 0]
         vy = v[..., 1]
         vz = v[..., 2]
-        # 标准公式: v' = v + 2*w*(q_xyz × v) + 2*(q_xyz × (q_xyz × v))
         tx = 2 * (y * vz - z * vy)
         ty = 2 * (z * vx - x * vz)
         tz = 2 * (x * vy - y * vx)
@@ -521,7 +513,9 @@ class DualArmPegHoleEnv(IsaacSim):
 
     @staticmethod
     def _quat_mul(q1_wxyz, q2_wxyz):
-        """四元数乘法, 支持广播, 输入输出都用 (w, x, y, z)."""
+        """四元数乘法 (wxyz), 支持广播."""
+        if q2_wxyz.dim() == 1:
+            q2_wxyz = q2_wxyz.unsqueeze(0).expand(q1_wxyz.shape[0], -1)
         w1, x1, y1, z1 = q1_wxyz.unbind(dim=-1)
         w2, x2, y2, z2 = q2_wxyz.unbind(dim=-1)
         return torch.stack([
@@ -531,101 +525,126 @@ class DualArmPegHoleEnv(IsaacSim):
             w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
         ], dim=-1)
 
-    def _find_cloned_prim_paths(self, relative_suffix):
-        """遍历 stage 找所有以 relative_suffix 结尾的 prim path, 按字符串排序.
+    def _verify_peghole_prims_exist(self):
+        """fail fast: peg_tip / hole_entry prim 不在 stage 直接 raise.
 
-        这样不依赖 cloner 的精确命名模式; 只要 peg_tip/hole_entry 的相对路径在
-        USDA 里是稳定的, 就能发现所有 cloned env 里的副本.
+        老的 phase 1.5 实现是 print 后继续跑; 现在主线已经是 peg-in-hole, 加载
+        无 peg/hole 的 USD 必然导致 _create_observation 用错误的常量 offset
+        生成无意义的 frame. 早死早超生.
         """
         try:
             import omni.usd
         except ImportError:
-            return []
+            return  # 单元测试或非 IsaacSim 路径下跳过
         stage = omni.usd.get_context().get_stage()
         if stage is None:
-            return []
-        suffix = "/" + relative_suffix.lstrip("/")
-        paths = []
+            raise RuntimeError("USD stage 还没初始化 — peg/hole 检查无法执行")
+        peg_found = hole_found = False
         for prim in stage.Traverse():
             p = str(prim.GetPath())
-            if p.endswith(suffix):
-                paths.append(p)
-        def env_sort_key(path):
-            m = re.search(r"/env_(\d+)(?:/|$)", path)
-            return (int(m.group(1)) if m else -1, path)
-        paths.sort(key=env_sort_key)
-        return paths
-
-    def _query_world_pose_quat(self, prim_view):
-        """用 IsaacSim live xform view 查 prim 的世界位姿.
-
-        Returns:
-            pos [N, 3], quat [N, 4] (wxyz), 都在 self._device 上, dtype 与 joint limits 一致.
-        """
-        dtype = self._joint_lower.dtype
-        pos, quat = prim_view.get_world_poses(usd=False)
-        pos = torch.as_tensor(pos, device=self._device, dtype=dtype)
-        quat = torch.as_tensor(quat, device=self._device, dtype=dtype)
-        return pos, quat
+            if p.endswith("/Peg/peg_tip"):
+                peg_found = True
+            if p.endswith("/Hole/hole_entry"):
+                hole_found = True
+            if peg_found and hole_found:
+                return
+        raise RuntimeError(
+            "stage 里找不到 peg_tip / hole_entry prim. "
+            f"usd_path={self._usd_path}\n"
+            "M0+ 要求加载带 peg/hole 视觉资产的 USDA. "
+            "用 dual_arm_iiwa_with_peghole.usda, 或重跑 build_peghole_usd.py 生成."
+        )
 
     def get_preinsert_frames(self):
-        """返回 peg_tip / hole_entry / preinsert_target 的世界帧位姿.
+        """返回 peg_tip / hole_entry / preinsert_target 的世界帧位姿 (env-local).
 
-        这是 phase 1.5 **纯读** helper — 不改 reward/obs/is_absorbing, 不影响训练
-        语义. 留给 visualize_targets (commit 2) 和后续 commit 3 的 task error
-        计算使用.
+        训练循环里 _create_observation 已经算并缓存了同样的量; 但 visualize_*
+        的主循环可能在两次 step 之间没经过 _create_observation, cache 会 stale.
+        所以这里强制重新查一次 fresh raw obs 再算.
 
-        Returns None 当 peg/hole 不在 stage 里 (用户加载了老 USD).
-        否则返回 dict of batched tensors (都是世界坐标, batch=num_envs):
+        Returns batched dict (batch=num_envs):
             peg_tip_pos          [N, 3]
-            peg_tip_quat         [N, 4]  wxyz
-            peg_axis             [N, 3]  unit, 就是 peg 本地 +Z 在世界里的方向
+            peg_tip_quat         [N, 4]  wxyz, = LeftEE_quat
+            peg_axis             [N, 3]  unit, R(LeftEE_quat) · PEG_AXIS_IN_LEFTEE
+            peg_axis_quat        [N, 4]  让 +Z apply 后等于 peg_axis 的 quat
             hole_entry_pos       [N, 3]
-            hole_entry_quat      [N, 4]
-            hole_axis            [N, 3]  unit, hole 开口朝向 (hole 本地 +Z 在世界)
-            preinsert_target_pos [N, 3]  hole_entry_pos + preinsert_offset * hole_axis
-            preinsert_target_quat[N, 4]  = hole_entry_quat (同一帧)
-
-        几何含义: peg/hole 都是圆柱, 它们的 local +Z 即对称轴. peg 从 preinsert_target
-        沿 -hole_axis 方向往 hole_entry 插入 -> 理想装配时
-        dot(peg_axis, hole_axis) ≈ -1 (轴反平行, 面对面).
+            hole_entry_quat      [N, 4]  wxyz, = RightEE_quat
+            hole_axis            [N, 3]
+            hole_axis_quat       [N, 4]
+            preinsert_target_pos [N, 3]
+            preinsert_target_quat[N, 4]
         """
-        if self._peg_tip_view is None or self._hole_entry_view is None:
-            return None
-        if (len(self._peg_tip_paths) != self._n_envs
-                or len(self._hole_entry_paths) != self._n_envs):
-            print(
-                "[PREINSERT] prim 数量与 num_envs 不一致, "
-                f"peg_tip={len(self._peg_tip_paths)} "
-                f"hole_entry={len(self._hole_entry_paths)} "
-                f"num_envs={self._n_envs}"
-            )
-            return None
+        raw = self.observation_helper.build_obs(self._task.get_observations(clone=True))
+        left_ee = self.observation_helper.get_from_obs(raw, "left_ee_pos")
+        right_ee = self.observation_helper.get_from_obs(raw, "right_ee_pos")
+        left_quat = self.observation_helper.get_from_obs(raw, "left_ee_rot")
+        right_quat = self.observation_helper.get_from_obs(raw, "right_ee_rot")
 
-        peg_tip_pos, peg_tip_quat = self._query_world_pose_quat(self._peg_tip_view)
-        hole_entry_pos, hole_entry_quat = self._query_world_pose_quat(self._hole_entry_view)
+        peg_tip = left_ee + self._quat_apply(left_quat, self._peg_tip_offset)
+        hole_entry = right_ee + self._quat_apply(right_quat, self._hole_entry_offset)
+        peg_axis = self._quat_apply(left_quat, self._peg_axis_local)
+        hole_axis = self._quat_apply(right_quat, self._hole_axis_local)
+        peg_axis = peg_axis / peg_axis.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        hole_axis = hole_axis / hole_axis.norm(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        unit_z = torch.zeros_like(peg_tip_pos)
-        unit_z[..., 2] = 1.0
-        flip_x_180 = torch.zeros_like(peg_tip_quat)
-        flip_x_180[..., 1] = 1.0
-        peg_axis_quat = self._quat_mul(peg_tip_quat, flip_x_180)
-        peg_axis = self._quat_apply(peg_axis_quat, unit_z)
-        hole_axis_quat = hole_entry_quat
-        hole_axis = self._quat_apply(hole_entry_quat, unit_z)
+        peg_axis_quat = self._quat_mul(left_quat, self._peg_axis_quat_offset)
+        hole_axis_quat = self._quat_mul(right_quat, self._hole_axis_quat_offset)
 
-        preinsert_target_pos = hole_entry_pos + self._preinsert_offset * hole_axis
-        preinsert_target_quat = hole_entry_quat.clone()
+        preinsert_target_pos = hole_entry + self._preinsert_offset * hole_axis
+        preinsert_target_quat = hole_axis_quat.clone()
 
         return {
-            "peg_tip_pos": peg_tip_pos,
-            "peg_tip_quat": peg_tip_quat,
+            "peg_tip_pos": peg_tip,
+            "peg_tip_quat": left_quat,
             "peg_axis_quat": peg_axis_quat,
             "peg_axis": peg_axis,
-            "hole_entry_pos": hole_entry_pos,
-            "hole_entry_quat": hole_entry_quat,
+            "hole_entry_pos": hole_entry,
+            "hole_entry_quat": right_quat,
             "hole_axis_quat": hole_axis_quat,
             "hole_axis": hole_axis,
             "preinsert_target_pos": preinsert_target_pos,
             "preinsert_target_quat": preinsert_target_quat,
+        }
+
+    def _compute_preinsert_errors(self, frames=None):
+        """完整 preinsert 几何误差 — 给 visualize_* 的诊断输出用, 不进 reward.
+
+        训练 reward / is_absorbing 走 _compute_task_errors (从 cached agent obs
+        切片读); 这条路径独立查 fresh raw obs, 适合 visualize/diagnose 主循环.
+        success_mask 用与训练一致的 (pos<pos_th) ∧ (axis<axis_th) 表达式, axis_th
+        默认 inf 时退化为 pos-only.
+        """
+        if frames is None:
+            frames = self.get_preinsert_frames()
+        peg_tip = frames["peg_tip_pos"]
+        hole_entry = frames["hole_entry_pos"]
+        preinsert_target = frames["preinsert_target_pos"]
+        peg_axis = frames["peg_axis"]
+        hole_axis = frames["hole_axis"]
+
+        pos_vec = peg_tip - preinsert_target
+        pos_err = torch.norm(pos_vec, dim=-1)
+
+        axis_dot = torch.sum(peg_axis * hole_axis, dim=-1).clamp(-1.0, 1.0)
+        axis_err = 1.0 + axis_dot
+
+        d = peg_tip - hole_entry
+        axial_dist = torch.sum(d * hole_axis, dim=-1)
+        radial_vec = d - axial_dist.unsqueeze(-1) * hole_axis
+        radial_err = torch.norm(radial_vec, dim=-1)
+
+        success_mask = (
+            (pos_err < self._preinsert_success_pos_threshold)
+            & (axis_err < self._success_axis_threshold)
+        )
+
+        return {
+            "pos_vec": pos_vec,
+            "pos_err": pos_err,
+            "axis_dot": axis_dot,
+            "axis_err": axis_err,
+            "axial_dist": axial_dist,
+            "radial_vec": radial_vec,
+            "radial_err": radial_err,
+            "success_mask": success_mask,
         }

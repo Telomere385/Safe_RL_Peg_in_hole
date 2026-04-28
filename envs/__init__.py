@@ -1,11 +1,11 @@
 from .dual_arm_peg_hole_env import (
-    DEFAULT_LEFT_CHEST_TARGET,
-    DEFAULT_RIGHT_CHEST_TARGET,
+    AGENT_OBS_DIM,
+    DEFAULT_PREINSERT_OFFSET,
     DualArmPegHoleEnv,
 )
 
 __all__ = [
-    "DEFAULT_LEFT_CHEST_TARGET",
-    "DEFAULT_RIGHT_CHEST_TARGET",
+    "AGENT_OBS_DIM",
+    "DEFAULT_PREINSERT_OFFSET",
     "DualArmPegHoleEnv",
 ]

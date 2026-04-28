@@ -2,21 +2,31 @@
 
 eval_sac.py 是数值验证, 这个脚本是肉眼验证. mushroom 的 VectorCore.evaluate
 是全自动的, absorb 一触发 episode 立刻 reset, 你根本看不到"agent 稳稳停在
-目标点"那一帧. 这里通过 monkey-patch is_absorbing, 让 env 在指定 env 计数器
-达到 hold-N 时调 _world.render() 反复刷, 不调 _world.step(), 物理就冻住了.
+preinsert"那一帧. 这里通过 monkey-patch is_absorbing, 让 env 在指定 env
+计数器达到 hold-N 时调 _world.render() 反复刷, 不调 _world.step(), 物理就冻住了.
+
+stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mask =
+(pos<pos_th) ∧ (axis_err<axis_th). M2a/M2b 评估时**必须**传 --rew_axis 和
+--success_axis_threshold 与训练时一致, 否则 axis_th=inf 会让 freeze 在"位置
+进阈但姿态没达标"时误触发, 看到的不是 M2 真正的成功状态.
 
 用法:
     conda activate safe_rl
-    python scripts/visualize_policy.py
+    # M1' 视觉验证
+    python scripts/visualize_policy.py --preinsert_success_pos_threshold 0.10
+
+    # M2a 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.5)
+    python scripts/visualize_policy.py \\
+        --preinsert_success_pos_threshold 0.10 \\
+        --rew_axis 1.0 --success_axis_threshold 0.5
+
     python scripts/visualize_policy.py --freeze_seconds 30
-    python scripts/visualize_policy.py --viz_env_idx 1     # 看 env 1 而不是 env 0
-    python scripts/visualize_policy.py --hold_steps 30     # 等更长的 hold 才冻结
+    python scripts/visualize_policy.py --viz_env_idx 1
+    python scripts/visualize_policy.py --hold_steps 30
 
 注意:
 - 必须 num_envs >= 2 (cloner bug).
-- terminal_hold_bonus 强制设 0, 否则 env 自己会在 hold-N absorb 把 episode reset 掉,
-  你来不及冻结. 我们手动检测 counter 并冻结.
-- 监视 env 0 比较稳: env 0 是 marker spawn 的位置, 红绿球肯定在它的 EE 目标点上.
+- terminal_hold_bonus 强制设 0, 否则 env 自己会在 hold-N absorb 把 episode reset.
 """
 
 import argparse
@@ -38,12 +48,20 @@ def parse_args():
                    default=str(PROJECT_ROOT / "results/best_agent.msh"))
     p.add_argument("--num_envs", type=int, default=2,
                    help="至少 2 (num_envs=1 触发 cloner bug)")
-    p.add_argument("--viz_env_idx", type=int, default=0,
-                   help="哪个 env 满足 hold-N 时冻结. env 0 才有 marker 球")
-    p.add_argument("--success_pos_threshold", type=float, default=0.10,
-                   help="跟 train 一致, 默认 0.10")
-    p.add_argument("--initial_joint_noise", type=float, default=0.05,
-                   help="跟 train 一致, 默认 0.05")
+    p.add_argument("--viz_env_idx", type=int, default=0)
+    p.add_argument("--preinsert_success_pos_threshold", type=float, default=0.10,
+                   help="跟 train 一致 (env/train/eval 默认 0.10m, M1'/M2 curriculum). "
+                        "传更紧的值会让 freeze 条件更严, 可能看不到 hold-N 触发.")
+    p.add_argument("--initial_joint_noise", type=float, default=0.1,
+                   help="跟 env/train 默认 0.1 一致 (M1' 训练时的 reset 噪声).")
+    p.add_argument("--preinsert_offset", type=float, default=None,
+                   help="覆盖 env 的 preinsert offset (默认 0.05m)")
+    p.add_argument("--rew_axis", type=float, default=None,
+                   help="覆盖 env 的 axis_err 权重. visualize 不算 reward, 但保留 "
+                        "CLI 一致性 (env 内部根据这个值打印的 axis 项形式不同).")
+    p.add_argument("--success_axis_threshold", type=float, default=None,
+                   help="**必须与 train 一致**. M2a 用 0.5, M2b 用 0.2. 不传 = "
+                        "默认 inf = M1' 行为, 会让 freeze 在 axis 还没对齐时误触发.")
     p.add_argument("--hold_steps", type=int, default=10,
                    help="连续 N 步在阈内即冻结. 默认 10 = 跟 train 的 hold_success_steps 一致")
     p.add_argument("--n_episodes", type=int, default=2,
@@ -57,24 +75,31 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not (0 <= args.viz_env_idx < args.num_envs):
+        raise ValueError(
+            f"--viz_env_idx ({args.viz_env_idx}) 必须落在 [0, {args.num_envs - 1}]"
+        )
 
-    from envs import (
-        DEFAULT_LEFT_CHEST_TARGET,
-        DEFAULT_RIGHT_CHEST_TARGET,
-        DualArmPegHoleEnv,
-    )
+    from envs import DualArmPegHoleEnv
 
-    # terminal_hold_bonus=0 让 env 不自动 absorb; 我们读 counter 自己冻结
-    mdp = DualArmPegHoleEnv(
+    env_kwargs = dict(
         num_envs=args.num_envs,
         headless=False,
-        left_target=DEFAULT_LEFT_CHEST_TARGET,
-        right_target=DEFAULT_RIGHT_CHEST_TARGET,
-        success_pos_threshold=args.success_pos_threshold,
+        preinsert_success_pos_threshold=args.preinsert_success_pos_threshold,
         initial_joint_noise=args.initial_joint_noise,
         success_hold_steps=args.hold_steps,
         terminal_hold_bonus=0.0,
     )
+    if args.preinsert_offset is not None:
+        env_kwargs["preinsert_offset"] = args.preinsert_offset
+    if args.rew_axis is not None:
+        env_kwargs["rew_axis"] = args.rew_axis
+    if args.success_axis_threshold is not None:
+        env_kwargs["success_axis_threshold"] = args.success_axis_threshold
+    mdp = DualArmPegHoleEnv(**env_kwargs)
+    print(f"[VIZ STAGE] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
+          f"axis_th={mdp._success_axis_threshold:.3f}  "
+          f"w_axis={mdp._w_axis:.3f}")
 
     from mushroom_rl.core import Agent, VectorCore
 
@@ -82,7 +107,6 @@ def main():
     print(f"[VIZ] loaded agent from {args.agent_path}")
     print(f"[VIZ] watching env {args.viz_env_idx} for {args.hold_steps} consecutive in_thresh steps")
 
-    # Monkey-patch is_absorbing: env 0 一达到 hold-N 就冻 IsaacSim
     state = {"frozen": False, "step_idx": 0}
     original_is_absorbing = mdp.is_absorbing
 
@@ -91,25 +115,28 @@ def main():
         state["step_idx"] += 1
         cnt = int(mdp._consecutive_inthresh[args.viz_env_idx].item())
         if cnt > 0 and state["step_idx"] % 5 == 0:
-            left_err, right_err, _ = mdp._last_task_errors
+            pos_err = mdp._last_pos_err
+            axis_err = mdp._last_axis_err
             print(f"  step {state['step_idx']}  env {args.viz_env_idx}  "
                   f"hold count={cnt}  "
-                  f"left_err={float(left_err[args.viz_env_idx]):.4f}m  "
-                  f"right_err={float(right_err[args.viz_env_idx]):.4f}m")
+                  f"pos_err={float(pos_err[args.viz_env_idx]):.4f}m  "
+                  f"axis_err={float(axis_err[args.viz_env_idx]):.4f}")
         if not state["frozen"] and cnt >= args.hold_steps:
-            left_err, right_err, _ = mdp._last_task_errors
+            pos_err = mdp._last_pos_err
+            axis_err = mdp._last_axis_err
             print(
                 f"\n[FREEZE] env {args.viz_env_idx} reached hold-{args.hold_steps} "
                 f"at step {state['step_idx']}\n"
-                f"  left_err = {float(left_err[args.viz_env_idx]):.4f}m\n"
-                f"  right_err = {float(right_err[args.viz_env_idx]):.4f}m\n"
+                f"  pos_err  = {float(pos_err[args.viz_env_idx]):.4f}m\n"
+                f"  axis_err = {float(axis_err[args.viz_env_idx]):.4f}  "
+                f"(0 = perfect; success_axis_threshold = {mdp._success_axis_threshold:.3f})\n"
                 f"  freezing for {args.freeze_seconds:.1f}s, Ctrl-C to exit early"
             )
             state["frozen"] = True
             end_t = time.monotonic() + args.freeze_seconds
             try:
                 while time.monotonic() < end_t:
-                    mdp._world.render()  # render-only, 不 step 物理 → 画面冻结
+                    mdp._world.render()
                     time.sleep(0.05)
             except KeyboardInterrupt:
                 pass
@@ -128,7 +155,6 @@ def main():
     if not state["frozen"]:
         print(f"\n[VIZ] env {args.viz_env_idx} 在 {args.n_episodes} episode "
               f"({state['step_idx']} 步) 内没达到 hold-{args.hold_steps}.")
-        print(f"      可能起手位置组合不利, 或 agent 真的不行. 重跑或 --viz_env_idx 1 试试.")
 
     mdp.stop()
 
