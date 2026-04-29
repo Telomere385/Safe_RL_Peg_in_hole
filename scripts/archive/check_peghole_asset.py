@@ -4,11 +4,11 @@
 用法
 ----
 # 基线: 老 USD
-python scripts/check_peghole_asset.py --usd assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd \
+python scripts/archive/check_peghole_asset.py --usd assets/usd/dual_arm_iiwa/dual_arm_iiwa.usd \
     > /tmp/check_old.txt
 
 # 新 composed USDA
-python scripts/check_peghole_asset.py --usd assets/usd/dual_arm_iiwa/dual_arm_iiwa_with_peghole.usda \
+python scripts/archive/check_peghole_asset.py --usd assets/usd/dual_arm_iiwa/dual_arm_iiwa_with_peghole.usda \
     > /tmp/check_new.txt
 
 # 对比 articulation 数值 (这几行必须完全一样)
@@ -16,7 +16,7 @@ diff /tmp/check_old.txt /tmp/check_new.txt
 # 预期 diff: 仅 [USD] 行和 [PRIM] 行不同; [NUM_DOF] / [DEFAULT_*] / [G0_*] / [CONTROLLED_JOINTS_IDX] 行完全一致.
 
 # 肉眼验证 peg/hole 位置 (开窗口, 默认 5s 后自动退出)
-python scripts/check_peghole_asset.py \
+python scripts/archive/check_peghole_asset.py \
     --usd assets/usd/dual_arm_iiwa/dual_arm_iiwa_with_peghole.usda \
     --render --duration 20
 
@@ -31,7 +31,8 @@ from pathlib import Path
 
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 归档目录在 scripts/archive/, 项目根需 parents[2] 才到 bimanual_peghole/.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 

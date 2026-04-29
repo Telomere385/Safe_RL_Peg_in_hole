@@ -24,7 +24,7 @@
 
 运行:
     conda activate safe_rl
-    python scripts/diagnose_m1_axis.py --headless --num_envs 16 --n_episodes 64
+    python scripts/archive/diagnose_m1_axis.py --headless --num_envs 16 --n_episodes 64
 
 输出会同时打印整体分布和"pos_err < threshold"条件下的子集分布.
 """
@@ -36,7 +36,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 归档目录在 scripts/archive/, 项目根需 parents[2] 才到 bimanual_peghole/.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts._eval_utils import deterministic_policy, resolve_eval_episode_count
