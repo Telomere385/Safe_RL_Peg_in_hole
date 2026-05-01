@@ -175,19 +175,22 @@ def _spawn_sphere_proxy_markers(mdp):
 
 
 def _update_sphere_proxy_markers(mdp, sphere_handles, env_idx, env_offset_world):
+    """sphere proxy 球心: physics_view.get_link_transforms 返回 world 坐标,
+    marker 在 /World/viz/ 下也是 world, 直接对齐, 不加 env_offset.
+    (preinsert markers 走 BODY_POS = env-local, 那条路才需要加 offset.)
+    """
     if sphere_handles is None:
         return
     from pxr import Gf
     _, info = mdp._compute_min_clearance()
-    left_p = info["left_proxies"][env_idx].detach().cpu()    # [19, 3]
+    left_p = info["left_proxies"][env_idx].detach().cpu()    # [19, 3] world
     right_p = info["right_proxies"][env_idx].detach().cpu()
-    ox, oy, oz = env_offset_world
     for i, t_op in enumerate(sphere_handles["left"]):
         x, y, z = left_p[i].tolist()
-        t_op.Set(Gf.Vec3d(x + ox, y + oy, z + oz))
+        t_op.Set(Gf.Vec3d(x, y, z))
     for i, t_op in enumerate(sphere_handles["right"]):
         x, y, z = right_p[i].tolist()
-        t_op.Set(Gf.Vec3d(x + ox, y + oy, z + oz))
+        t_op.Set(Gf.Vec3d(x, y, z))
 
 
 def _update_preinsert_markers(frames, handles, env_idx, env_offset_world):
@@ -363,6 +366,22 @@ def main():
     _print_preinsert_frames(frames, errors, args.viz_env_idx)
     _update_preinsert_markers(frames, handles, args.viz_env_idx, env_offset_world)
     _update_sphere_proxy_markers(mdp, sphere_handles, args.viz_env_idx, env_offset_world)
+    # frame 验证: proxy 索引 16 = left_hande_robotiq_hande_link, 跟 BODY_POS 的
+    # left_ee_pos 是同一个 link. 两者应该差一个 env_offset (proxy 是 world,
+    # BODY_POS 是 env-local). 真实差值 ≈ env_offset_world 即说明 frame 假设对.
+    if sphere_handles is not None:
+        _, _info = mdp._compute_min_clearance()
+        proxy_ee_world = _info["left_proxies"][args.viz_env_idx, 16].detach().cpu().tolist()
+        body_ee_local = frames["peg_tip_pos"][args.viz_env_idx].detach().cpu().tolist()
+        peg_offset_local = mdp._peg_tip_offset.detach().cpu().tolist()
+        # peg_tip = LeftEE + R · peg_tip_offset, 反推 left_ee_local ≈ peg_tip - peg_tip_offset_world,
+        # 但 peg_tip_offset 经过 quat 旋转, 这里只做粗对比 (忽略 ~0.13m 偏移项)
+        diff = [proxy_ee_world[k] - body_ee_local[k] for k in range(3)]
+        print(f"[VIS FRAME-CHECK] env {args.viz_env_idx}: "
+              f"proxy_ee_world={tuple(round(v, 4) for v in proxy_ee_world)} "
+              f"body_ee_local≈{tuple(round(v, 4) for v in body_ee_local)} "
+              f"diff={tuple(round(v, 4) for v in diff)} "
+              f"env_offset={tuple(round(v, 4) for v in env_offset_world)}")
 
     if args.duration <= 0:
         print("[VIS] 窗口已打开. 观察完后按 Ctrl-C 退出.")
