@@ -91,11 +91,14 @@ environment.yml
   的梯度给出来; 完整向量与 EE quat 强冗余, 徒增维度. radial / axial 分量留到 Step 3+.
 - **Peg / Hole frame** (env-local, 解析式):
   ```
-  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, 0, 0.1425)
-  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, 0, 0.140)
+  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, 0, 0.160)
+  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, 0, 0.155)
   peg_axis  =                R(LeftEE_quat)  · (0, 0, +1)
   hole_axis =                R(RightEE_quat) · (0, 0, +1)
   ```
+  Peg 圆柱 (radius=0.016, height=0.070), hole 空心圆柱 (outer=0.024,
+  inner=0.020, height=0.060) — 2× 放大版, hole 直径 48mm 给 50mm Hande
+  夹持留 2mm 余量.
   Step 2 重新设计后, peg/hole 轴沿 EE 局部 +Z = 夹爪正前方; 双臂 ready pose
   对面时两侧 +Z 在 world 中天然反平行 = 完美对齐 (axis_dot = -1).
   绕过 XFormPrim → Fabric flush 链路, headless / `render=False` 也保证 fresh.

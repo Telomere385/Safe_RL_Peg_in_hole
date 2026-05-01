@@ -102,25 +102,17 @@ RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 # clearance = ||c_L - c_R|| - r_L - r_R, 取 min. 这是 PhysX 接触力检测之外的
 # 几何 proxy, 用于阻止双臂 cross-over (PhysX 力检测在 1cm-5cm 边缘失明).
 #
-# 每侧 19 球 = 8 关节球 (link_0..link_7) + 7 中点球 (相邻 link 直线中点)
-#            + 4 EE 球 (coupler, hande_link, left_finger, right_finger).
+# 每侧 15 球 = 8 关节球 (link_0..link_7) + 7 中点球 (相邻 link 直线中点).
 # 中点用 0.5*(BODY_POS[i] + BODY_POS[i+1]); iiwa link 大体直筒, 直线中点
 # 与 mesh 几何中心差距小, 不需要查 inertial / visual mesh, 完全只读 BODY_POS.
+# 夹爪段 (coupler / hande_link / fingers) 不放 sphere — peg/hole 在它们前面
+# 伸出, 把球放到夹爪上会和 peg/hole 视觉重叠且本身不是 cross-over 关键区.
 LEFT_ARM_JOINT_BODY_NAMES = [f"left_arm_link_{i}" for i in range(0, 8)]   # 8 球
 RIGHT_ARM_JOINT_BODY_NAMES = [f"right_arm_link_{i}" for i in range(0, 8)]
-LEFT_EE_PROXY_BODY_NAMES = [
-    "left_hande_robotiq_hande_coupler",
-    "left_hande_robotiq_hande_link",
-    "left_hande_robotiq_hande_left_finger",
-    "left_hande_robotiq_hande_right_finger",
-]
-RIGHT_EE_PROXY_BODY_NAMES = [
-    "right_hande_robotiq_hande_coupler",
-    "right_hande_robotiq_hande_link",
-    "right_hande_robotiq_hande_left_finger",
-    "right_hande_robotiq_hande_right_finger",
-]
-# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin), ee 3cm (hande/finger 直径 ~4-6cm).
+LEFT_EE_PROXY_BODY_NAMES: list[str] = []
+RIGHT_EE_PROXY_BODY_NAMES: list[str] = []
+# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin). EE 半径已无 sphere 使用,
+# 但保留参数防止外部 CLI 透传报错.
 ARM_PROXY_RADIUS = 0.06
 EE_PROXY_RADIUS = 0.03
 
@@ -132,10 +124,12 @@ EE_PROXY_RADIUS = 0.03
 #   所以 peg_tip 在 LeftEE 帧:  (PART_X, 0, PART_Z + PEG_HEIGHT/2)
 _PART_X = -0.0055
 _PART_Z = 0.125
-_PEG_HEIGHT = 0.035
-_HOLE_HEIGHT = 0.030
-_PEG_TIP_LOCAL_Z = 0.5 * _PEG_HEIGHT       # 0.0175
-_HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.015
+# 2× 放大 (Step 2 重设计). hole_outer = 24mm 半径 = 48mm 直径, 给 Robotiq
+# Hande 50mm 开度留 2mm 安全余量. 长宽等比放大保持原始比例.
+_PEG_HEIGHT = 0.070
+_HOLE_HEIGHT = 0.060
+_PEG_TIP_LOCAL_Z = 0.5 * _PEG_HEIGHT       # 0.035
+_HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.030
 
 PEG_TIP_OFFSET_IN_LEFTEE = (_PART_X, 0.0, _PART_Z + _PEG_TIP_LOCAL_Z)
 HOLE_ENTRY_OFFSET_IN_RIGHTEE = (_PART_X, 0.0, _PART_Z + _HOLE_ENTRY_LOCAL_Z)

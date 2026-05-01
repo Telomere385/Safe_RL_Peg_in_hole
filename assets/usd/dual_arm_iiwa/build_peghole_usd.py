@@ -41,11 +41,13 @@ import numpy as np
 
 
 # 几何 ----------------------------------------------------------------------
-PEG_RADIUS   = 0.008
-PEG_HEIGHT   = 0.035
-HOLE_OUTER_R = 0.012
-HOLE_INNER_R = 0.010
-HOLE_HEIGHT  = 0.030
+# Step 2 重设计: 等比 2× 放大. hole_outer 24mm 半径 = 48mm 直径,
+# 给 Robotiq Hande 50mm 最大开度留 2mm 安全余量.
+PEG_RADIUS   = 0.016
+PEG_HEIGHT   = 0.070
+HOLE_OUTER_R = 0.024
+HOLE_INNER_R = 0.020
+HOLE_HEIGHT  = 0.060
 
 # 挂载偏移 (EE 本地帧, 应用 orient 之前) --------------------------------------
 PART_X = -0.0055   # 补偿夹爪 mimic 不对称的横向微偏
