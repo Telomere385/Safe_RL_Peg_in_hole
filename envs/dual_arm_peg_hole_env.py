@@ -221,7 +221,7 @@ class DualArmPegHoleEnv(IsaacSim):
         self._absorbing_terminal_active = self._terminal_hold_bonus > 0.0
         self._preinsert_success_pos_threshold = float(preinsert_success_pos_threshold)
         # success_axis_threshold 默认 inf = success 不检查 axis (M1' 行为).
-        # M2 时通过 CLI 设成 0.5 / 0.2. 用 inf 而不是 None 让 success_mask 表达式
+        # M2 时通过 CLI 设成 0.2. 用 inf 而不是 None 让 success_mask 表达式
         # 不需要 None-check 分支, 永远是干净的 (pos<pos_th) & (axis_err<axis_th).
         self._success_axis_threshold = float(success_axis_threshold)
         self._joint_limit_margin_frac = joint_limit_margin_frac

@@ -86,7 +86,7 @@ def parse_args():
                    help="覆盖 env 的动作 L2 惩罚权重")
     p.add_argument("--rew_home", type=float, default=None,
                    help="home regularizer 权重 (joint-range 归一化的 ||q - q_home||²). "
-                        "默认 0 关闭. 起步 0.002 当 tie-breaker, 偏好胸前 ready.")
+                        "默认 0 关闭. 当前 M1'/M2 建议 0.0005 当极弱 tie-breaker.")
     p.add_argument("--rew_success", type=float, default=None,
                    help="覆盖 env 的 per-step success bonus (默认 2.0)")
     p.add_argument("--rew_axis", type=float, default=None,

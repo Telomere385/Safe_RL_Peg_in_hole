@@ -182,7 +182,8 @@ python scripts/visualize_targets.py --n_resets 30   # 看 reset 分布
 # 跑训好的 policy, hold-N 满足时冻结画面 (M2 必须传 --success_axis_threshold!)
 python scripts/visualize_policy.py \
     --preinsert_success_pos_threshold 0.10 \
-    --rew_axis 1.0 --success_axis_threshold 0.5
+    --rew_home 0.0005 \
+    --rew_axis 1.0 --success_axis_threshold 0.2
 ```
 
 ### 资产校验 (改 USD 时跑)

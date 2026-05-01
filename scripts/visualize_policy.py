@@ -13,11 +13,16 @@ stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mas
 用法:
     conda activate safe_rl
     # M1' 视觉验证
-    python scripts/visualize_policy.py --preinsert_success_pos_threshold 0.10
+    python scripts/visualize_policy.py \\
+        --agent_path results/best_agent_M1p_32dim_pos10cm.msh \\
+        --preinsert_success_pos_threshold 0.10 \\
+        --rew_home 0.0005
 
     # M2 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.2)
     python scripts/visualize_policy.py \\
+        --agent_path results/best_agent_M2_axis02.msh \\
         --preinsert_success_pos_threshold 0.10 \\
+        --rew_home 0.0005 \\
         --rew_axis 1.0 --success_axis_threshold 0.2
 
     python scripts/visualize_policy.py --freeze_seconds 30
@@ -59,6 +64,9 @@ def parse_args():
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重. visualize 不算 reward, 但保留 "
                         "CLI 一致性 (env 内部根据这个值打印的 axis 项形式不同).")
+    p.add_argument("--rew_home", type=float, default=None,
+                   help="覆盖 env 的 home regularizer 权重. visualize 不依赖 reward, "
+                        "但保留与 train/eval CLI 一致性.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
                    help="**必须与 train 一致**. M2 用 0.2. 不传 = "
                         "默认 inf = M1' 行为, 会让 freeze 在 axis 还没对齐时误触发.")
@@ -101,6 +109,8 @@ def main():
         env_kwargs["preinsert_offset"] = args.preinsert_offset
     if args.rew_axis is not None:
         env_kwargs["rew_axis"] = args.rew_axis
+    if args.rew_home is not None:
+        env_kwargs["rew_home"] = args.rew_home
     if args.success_axis_threshold is not None:
         env_kwargs["success_axis_threshold"] = args.success_axis_threshold
     for key in ("clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):

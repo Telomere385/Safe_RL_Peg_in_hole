@@ -7,11 +7,15 @@ success / hold-N 触发条件不同, 数字没有可比性.
     conda activate safe_rl
     # M1' (pos-only)
     python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50
+        --agent_path results/best_agent_M1p_32dim_pos10cm.msh \\
+        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_home 0.0005
 
     # M2 (pos + axis)
     python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \\
+        --agent_path results/best_agent_M2_axis02.msh \\
         --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_home 0.0005 \\
         --rew_axis 1.0 --success_axis_threshold 0.2
 """
 
