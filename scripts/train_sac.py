@@ -110,7 +110,7 @@ def parse_args():
                         "N=10 ≈ 1s hold (per-step dt≈0.1s).")
     p.add_argument("--clearance_hard", type=float, default=None,
                    help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值 (m). 默认 0.0 = 球壳一接触即"
-                        "触发 hard absorbing. 传 -inf 关闭, 只信 PhysX 力检测.")
+                        "触发 hard absorbing. 关闭时写 --clearance_hard=-inf, 只信 PhysX 力检测.")
     p.add_argument("--proxy_arm_radius", type=float, default=None,
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,

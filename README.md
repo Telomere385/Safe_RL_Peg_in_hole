@@ -199,7 +199,7 @@ python scripts/archive/check_peghole_asset.py \
 | `--success_axis_threshold` | env=inf | axis_err 的 success 阈值. M1' inf, M2a 0.5, M2b 0.2 |
 | `--terminal_hold_bonus` | env=0.0 | hold-N 软 absorbing bonus, =0 关闭机制 |
 | `--hold_success_steps` | 10 | 连续 N 步 in-threshold 才算 success (≈1s) |
-| `--clearance_hard` | env=0.0 | sphere proxy 自碰撞兜底阈值. 0 = 球壳触碰即碰撞, `-inf` = 关闭 |
+| `--clearance_hard` | env=0.0 | sphere proxy 自碰撞兜底阈值. 0 = 球壳触碰即碰撞, `--clearance_hard=-inf` = 关闭 |
 | `--proxy_arm_radius` | env=0.06 | arm sphere proxy 半径 (m) |
 | `--proxy_ee_radius` | env=0.03 | EE sphere proxy 半径 (m) |
 
@@ -266,7 +266,7 @@ python scripts/archive/check_peghole_asset.py \
 - peg/hole 是**视觉 only**: 不产生接触力, 也不会触发 `arm_L`/`arm_R` collision
   group. Step 4 才会给 peg 加 `CollisionAPI` 并设计 collision group.
 - **sphere proxy 默认开启**, `clearance_hard=0.0` 球壳触碰即终止. 探索阶段如果
-  trip 太频繁拉爆 reset, 把它放松到 `-0.01` 或 `-0.02`; 极端调试时 `--clearance_hard -inf`
+  trip 太频繁拉爆 reset, 把它放松到 `-0.01` 或 `-0.02`; 极端调试时 `--clearance_hard=-inf`
   关掉, 退回纯 PhysX.
 
 ## 后续阶段 (规划)

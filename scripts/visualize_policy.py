@@ -72,7 +72,7 @@ def parse_args():
                    help="用 SAC 采样策略而不是 deterministic tanh(mu)")
     p.add_argument("--clearance_hard", type=float, default=None,
                    help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值. 应与 train 一致, "
-                        "否则可能出现 train 不撞 / viz 老 reset 的错觉.")
+                        "否则可能出现 train 不撞 / viz 老 reset 的错觉. 关闭写 --clearance_hard=-inf.")
     p.add_argument("--proxy_arm_radius", type=float, default=None,
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,

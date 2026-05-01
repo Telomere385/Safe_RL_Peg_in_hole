@@ -60,7 +60,7 @@ def parse_args():
                    help="验证 success 定义: episode 内至少出现连续 N 步都在阈值内.")
     p.add_argument("--clearance_hard", type=float, default=None,
                    help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值. 应与 train 时一致, "
-                        "否则碰撞触发率不同, success / J 数字不可比.")
+                        "否则碰撞触发率不同, success / J 数字不可比. 关闭写 --clearance_hard=-inf.")
     p.add_argument("--proxy_arm_radius", type=float, default=None,
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
