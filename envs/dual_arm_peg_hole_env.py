@@ -76,16 +76,17 @@ LEFT_ARM_JOINTS = [f"left_arm_A{i}" for i in CONTROLLED_IDX]
 RIGHT_ARM_JOINTS = [f"right_arm_A{i}" for i in CONTROLLED_IDX]
 ARM_JOINTS = LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS  # 14
 
-# Home pose — 取代 USD 自带的 zero 默认位姿. 双臂在胸前略弯肘的 ready 姿态,
-# 让 reset center 落在任务相关区域, 减少 M1' 早期探索的无效扇区.
-# 镜像约定 (实测 dual_arm_iiwa USD): A1 同号, A3 / A7 取反 — 第一次猜的
-# "奇数 joint 全取反" 在 right_A1 上不成立, 会让两夹爪 +Z 同向 (axis_err=1.99)
-# 而非对面. 当前值已使两侧 +Z 互指 (axis_dot ≈ -1).
+# Home pose — 取代 USD 自带的 zero 默认位姿. 双臂在胸前略弯肘的 ready 姿态.
+# 镜像约定实测: 不是 "奇数翻号" (右臂转到反方向), 也不是 "A1 同号 + A3/A7 翻号"
+# (axis_dot 仍 +0.57). 试 "右臂关节值 = 左臂关节值逐位相同" — 适用于
+# 双臂 USD 把镜像烘进 mounting frame, 而不是改 joint axis convention.
+# 视觉验证: dot(peg_axis, hole_axis) 应该 ≈ -1 (两侧 +Z 互指); 不对的话
+# 用 IsaacSim editor 手动调右臂 7 个值, 把 dot 调到 -1 后再写回这里.
 HOME_JOINT_POS = (
     # left arm  A1     A2      A3      A4     A5   A6   A7
     -2.568,  -0.250, -0.078,  0.814,  0.0, 0.0,  0.010,
-    # right arm A1     A2      A3      A4     A5   A6   A7
-    -2.568,  -0.250, +0.078,  0.814,  0.0, 0.0, -0.010,
+    # right arm = 左臂逐位相同
+    -2.568,  -0.250, -0.078,  0.814,  0.0, 0.0,  0.010,
 )
 assert len(HOME_JOINT_POS) == 14, "HOME_JOINT_POS 必须 14 维 (左 7 + 右 7)"
 
