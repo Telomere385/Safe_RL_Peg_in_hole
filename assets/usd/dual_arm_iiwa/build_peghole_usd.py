@@ -21,13 +21,13 @@ pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
   /bh_robot/right_hande_robotiq_hande_link/Hole
   /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
 
--- 几何与挂载参数 (照抄 ~/init_peg_hole_env.py) -----------------------------
+-- 几何与挂载参数 -----------------------------------------------------------
   PEG:  实心圆柱, radius=0.008, height=0.035, 轴 = local Z.
   HOLE: 空心圆柱 mesh, outer_r=0.012, inner_r=0.010, height=0.030,
         底封顶开 (方便 peg 从 +Z 插入).
-  挂载: translate = (PART_X, 0, PART_Z), orient = 绕 local X 转 +90°.
-        结果: peg/hole 的轴 (local Z) 在 EE 帧里指向 EE 的 -Y 方向
-        (即垂直于手指开合方向), 参考实现在 init_peg_hole_env.py:149-162.
+  挂载 (Step 2 新约定): translate = (PART_X, 0, PART_Z), orient = identity.
+        结果: peg/hole 的轴 (local Z) 直接对齐 EE 的 +Z 方向 = 夹爪正前方.
+        双臂 ready pose 对面时, 两侧 +Z 在 world 中天然反平行 = 完美对齐.
 
 -- 运行 ---------------------------------------------------------------------
   python assets/usd/dual_arm_iiwa/build_peghole_usd.py
@@ -35,7 +35,6 @@ pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import numpy as np
@@ -52,10 +51,10 @@ HOLE_HEIGHT  = 0.030
 PART_X = -0.0055   # 补偿夹爪 mimic 不对称的横向微偏
 PART_Z =  0.125    # 指间区域中心沿 EE 局部 +Z 的距离
 
-# 绕 local +X 旋转 +90°: quat (w, x, y, z) = (cos(π/4), sin(π/4), 0, 0) --------
-_HALF = math.pi / 4
-_C = math.cos(_HALF)
-_S = math.sin(_HALF)
+# identity orient: quat (w, x, y, z) = (1, 0, 0, 0). 不再做 R_x(+90°), 让
+# peg/hole 的 local +Z 直接对齐 EE +Z (夹爪正前方).
+_C = 1.0
+_S = 0.0
 
 # 颜色 ----------------------------------------------------------------------
 PEG_COLOR  = (0.85, 0.12, 0.10)   # red
@@ -145,7 +144,7 @@ Peg 和 Hole 是视觉-only 子节点, 没有 RigidBodyAPI / MassAPI / Collision
     /bh_robot/right_hande_robotiq_hande_link/Hole
     /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
 
-挂载: translate=({PART_X}, 0, {PART_Z}) + orient=90°/X.
+挂载: translate=({PART_X}, 0, {PART_Z}), orient=identity (轴沿 EE +Z = 夹爪前方).
 几何: PEG radius={PEG_RADIUS}, height={PEG_HEIGHT};
       HOLE outer_r={HOLE_OUTER_R}, inner_r={HOLE_INNER_R}, height={HOLE_HEIGHT}.
 \"\"\"

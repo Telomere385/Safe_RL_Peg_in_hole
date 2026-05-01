@@ -91,12 +91,13 @@ environment.yml
   的梯度给出来; 完整向量与 EE quat 强冗余, 徒增维度. radial / axial 分量留到 Step 3+.
 - **Peg / Hole frame** (env-local, 解析式):
   ```
-  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, -0.0175, 0.125)
-  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, -0.015,  0.125)
-  peg_axis  =                R(LeftEE_quat)  · (0, +1, 0)
-  hole_axis =                R(RightEE_quat) · (0, -1, 0)
+  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, 0, 0.1425)
+  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, 0, 0.140)
+  peg_axis  =                R(LeftEE_quat)  · (0, 0, +1)
+  hole_axis =                R(RightEE_quat) · (0, 0, +1)
   ```
-  常量来自 `build_peghole_usd.py` 的 `PART_X / PART_Z + R_x(+90°)` 推导.
+  Step 2 重新设计后, peg/hole 轴沿 EE 局部 +Z = 夹爪正前方; 双臂 ready pose
+  对面时两侧 +Z 在 world 中天然反平行 = 完美对齐 (axis_dot = -1).
   绕过 XFormPrim → Fabric flush 链路, headless / `render=False` 也保证 fresh.
 
 ### Reward (统一骨架)
@@ -106,6 +107,7 @@ environment.yml
 - w_axis    · axis_err                         # 1 + dot(peg_axis, hole_axis), 0 = ideal
 - w_joint_limit · joint_limit_norm             # 软极限, 进 margin 后才计 (default 0.02)
 - w_action  · ||raw a||²                       # pre-scale action, 与 action_scale 解耦 (default 0.005)
+- w_home    · ||(q - q_home) / joint_range||²  # 全 stage tie-breaker, 偏好 home pose (default 0)
 + w_success · 1[success]                       # per-step dwell bonus, 不终止 (default 2.0)
 success = (pos_err < pos_th) ∧ (axis_err < axis_th)
 ```
@@ -196,6 +198,7 @@ python scripts/archive/check_peghole_asset.py \
 | `--preinsert_success_pos_threshold` | env=0.10 | success 的 pos_err 阈值 (m) |
 | `--preinsert_offset` | env=0.05 | hole_entry 沿 hole_axis 的 preinsert 距离 (m) |
 | `--rew_axis` | env=0.0 | axis_err 权重. M1' 用 0, M2a/M2b 用 1.0 |
+| `--rew_home` | env=0.0 | home regularizer 权重. 0 = 关闭; 起步 0.002 当 tie-breaker |
 | `--success_axis_threshold` | env=inf | axis_err 的 success 阈值. M1' inf, M2a 0.5, M2b 0.2 |
 | `--terminal_hold_bonus` | env=0.0 | hold-N 软 absorbing bonus, =0 关闭机制 |
 | `--hold_success_steps` | 10 | 连续 N 步 in-threshold 才算 success (≈1s) |

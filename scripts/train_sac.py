@@ -86,6 +86,9 @@ def parse_args():
                    help="覆盖 env 的 preinsert offset (默认 0.05m)")
     p.add_argument("--rew_action", type=float, default=None,
                    help="覆盖 env 的动作 L2 惩罚权重")
+    p.add_argument("--rew_home", type=float, default=None,
+                   help="home regularizer 权重 (joint-range 归一化的 ||q - q_home||²). "
+                        "默认 0 关闭. 起步 0.002 当 tie-breaker, 偏好胸前 ready.")
     p.add_argument("--rew_success", type=float, default=None,
                    help="覆盖 env 的 per-step success bonus (默认 2.0)")
     p.add_argument("--rew_axis", type=float, default=None,
@@ -158,7 +161,7 @@ def main():
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_action", "rew_success", "rew_axis",
-                "success_axis_threshold", "terminal_hold_bonus",
+                "rew_home", "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:

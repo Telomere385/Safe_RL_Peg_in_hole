@@ -30,6 +30,7 @@ Reward (统一骨架):
     - w_axis    * axis_err                            # 1 + dot(peg_axis, hole_axis), 0 = ideal
     - w_joint_limit * joint_limit_norm
     - w_action  * sum(a_i^2)                          # raw action, 解耦 action_scale
+    - w_home    * sum( ((q-q_home)/joint_range)^2 )   # 全 stage tie-breaker, 偏好胸前 ready
     + w_success * 1[success]                          # per-step dwell bonus, 不终止
     success = (pos_err < pos_th) ∧ (axis_err < axis_th)
               # axis_th=inf 时退化为 pos-only — 这就是 M1' 的语义
@@ -124,13 +125,11 @@ ARM_PROXY_RADIUS = 0.06
 EE_PROXY_RADIUS = 0.03
 
 # Peg/Hole 几何与挂载常量 — 必须与 build_peghole_usd.py 保持一致.
-# 推导 (USD 应用顺序: orient 后 translate, 见 build script:
-#   xformOpOrder = ["xformOp:translate", "xformOp:orient"]):
-#   Peg/Hole 在 EE 帧里 = T(PART_X, 0, PART_Z) ∘ R_x(+90°)
-#   peg_tip 在 Peg 局部为 (0, 0, +PEG_HEIGHT/2)
-#   hole_entry 在 Hole 局部为 (0, 0, +HOLE_HEIGHT/2)
-# 所以 peg_tip 在 LeftEE 帧:  R_x(+90°)·(0,0,h/2) + (PART_X, 0, PART_Z)
-#                          = (PART_X, -h/2, PART_Z)
+# 新约定 (Step 2 重新设计):
+#   Peg/Hole 在 EE 帧里 = T(PART_X, 0, PART_Z), 不再 R_x(+90°).
+#   零件 local +Z = EE local +Z = 夹爪正前方; peg/hole 直接从夹爪前方伸出.
+#   peg_tip 在 Peg 局部 = (0, 0, +PEG_HEIGHT/2)
+#   所以 peg_tip 在 LeftEE 帧:  (PART_X, 0, PART_Z + PEG_HEIGHT/2)
 _PART_X = -0.0055
 _PART_Z = 0.125
 _PEG_HEIGHT = 0.035
@@ -138,24 +137,19 @@ _HOLE_HEIGHT = 0.030
 _PEG_TIP_LOCAL_Z = 0.5 * _PEG_HEIGHT       # 0.0175
 _HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.015
 
-PEG_TIP_OFFSET_IN_LEFTEE = (_PART_X, -_PEG_TIP_LOCAL_Z, _PART_Z)
-HOLE_ENTRY_OFFSET_IN_RIGHTEE = (_PART_X, -_HOLE_ENTRY_LOCAL_Z, _PART_Z)
+PEG_TIP_OFFSET_IN_LEFTEE = (_PART_X, 0.0, _PART_Z + _PEG_TIP_LOCAL_Z)
+HOLE_ENTRY_OFFSET_IN_RIGHTEE = (_PART_X, 0.0, _PART_Z + _HOLE_ENTRY_LOCAL_Z)
 
-# peg_axis: 沿用旧 XFormPrim 实现的 sign convention (peg_tip_quat * R_x(180°) 后
-# apply 到 +Z), 等价于 R(LeftEE_quat) · (0, +1, 0). 这样 axis_err = 1+dot 的
-# 0 = ideal-alignment 语义在新旧实现间一致, 避免 phase 1.5 visualize 验收过的
-# preinsert_target / dot 数值因为符号约定突变.
-PEG_AXIS_IN_LEFTEE = (0.0, +1.0, 0.0)
-# hole_axis: 直接 R(RightEE_quat) · (0,0,1) 经 R_x(+90°) = (0, -1, 0).
-HOLE_AXIS_IN_RIGHTEE = (0.0, -1.0, 0.0)
+# peg_axis / hole_axis: 都沿 EE 局部 +Z (夹爪前方). 双臂 ready pose 互相对面时,
+# left_EE +Z 指向右 EE, right_EE +Z 指向左 EE — 两个 world 向量天然反平行,
+# axis_dot = -1 = 完美对齐, 与原约定的 axis_err = 1 + dot 语义一致.
+PEG_AXIS_IN_LEFTEE = (0.0, 0.0, +1.0)
+HOLE_AXIS_IN_RIGHTEE = (0.0, 0.0, +1.0)
 
 # peg_axis_quat / hole_axis_quat — 给 visualize_targets 的箭头 orient 用.
-# peg_axis_quat = LeftEE_quat ∘ R_x(+90°) ∘ R_x(180°) = LeftEE_quat ∘ R_x(+270°)
-# R_x(270°) 的 wxyz quat: (cos 135°, sin 135°, 0, 0) = (-√2/2, +√2/2, 0, 0)
-_C45 = math.cos(math.pi / 4)
-_S45 = math.sin(math.pi / 4)
-PEG_AXIS_QUAT_OFFSET = (-_S45, _C45, 0.0, 0.0)   # R_x(270°), 沿用旧 flip 约定
-HOLE_AXIS_QUAT_OFFSET = (_C45, _S45, 0.0, 0.0)   # R_x(+90°), 无 flip
+# 现在轴方向 = EE +Z, 直接 apply LeftEE_quat 即可, offset = identity quat.
+PEG_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
+HOLE_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 
 # Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper
 # (obs_helper 的 idx_map 对应 raw obs 而非 agent obs).
@@ -187,6 +181,7 @@ class DualArmPegHoleEnv(IsaacSim):
         rew_success=2.0,
         rew_joint_limit=0.02,
         rew_action=0.005,
+        rew_home=0.0,
         success_hold_steps=10,
         terminal_hold_bonus=0.0,
         preinsert_success_pos_threshold=0.10,
@@ -212,6 +207,9 @@ class DualArmPegHoleEnv(IsaacSim):
         self._w_success = rew_success
         self._w_joint_limit = rew_joint_limit
         self._w_action = rew_action
+        # home regularizer: -w_home · ||(q - q_home) / joint_range||²
+        # 用 joint-range 归一化让不同关节贡献尺度对齐. =0 关闭 (向后兼容).
+        self._w_home = float(rew_home)
         # hold-N absorbing 设计 (沿用 phase 1): 连续 N 步在阈内即终止 + bonus.
         # bonus=0 时整个机制关闭 (baseline 行为).
         self._success_hold_steps = int(success_hold_steps)
@@ -522,12 +520,19 @@ class DualArmPegHoleEnv(IsaacSim):
         # action L2: pre-scale raw action, 与 action_scale 解耦
         action_sq = (self._last_raw_action ** 2).sum(dim=-1)
 
+        # home regularizer: 全 stage 通用的 tie-breaker, 偏好 q_home (胸前 ready).
+        # joint-range 归一化让 14 维贡献尺度一致. w_home=0 时项消失.
+        joint_range = self._joint_upper - self._joint_lower
+        home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
+        home_norm = (home_dev ** 2).sum(dim=-1)
+
         # rew_axis=0 时 axis 项消失, 这就是 M1' 行为. M2 通过 CLI 把它打开.
         normal = (
             -self._w_pos * pos_err
             - self._w_axis * axis_err
             - self._w_joint_limit * joint_limit_norm
             - self._w_action * action_sq
+            - self._w_home * home_norm
             + self._w_success * success
         )
 
