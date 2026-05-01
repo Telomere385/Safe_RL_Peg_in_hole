@@ -4,27 +4,23 @@ obs 32 维 (joint_pos+joint_vel+pos_vec+axis_dot), 同一个 env / 同一个 obs
 reward 骨架. stage 用 reward 权重 + success_axis_threshold 切换:
 
     M1' = pos-only           --rew_axis 0.0  --success_axis_threshold inf
-    M2a = pos + 粗轴对齐      --rew_axis 1.0  --success_axis_threshold 0.5
-    M2b = pos + 紧轴对齐      --rew_axis 1.0  --success_axis_threshold 0.2
+    M2  = pos + axis 对齐    --rew_axis 1.0  --success_axis_threshold 0.2
 
-M2a/M2b 用 --load_agent path/to/M1p_checkpoint.msh 续训, 不用 cold start.
+M2 用 --load_agent path/to/M1p_checkpoint.msh 续训, 不用 cold start.
+(若直接到 0.2 太难, 可以先 warmup 短跑 0.5 当 debug, 但不作为正式 stage.)
 
 运行:
     conda activate safe_rl
     # M1': 建立 32 维 baseline (相当于 pos-only)
     python scripts/train_sac.py --no_wandb \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50
+        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_home 0.0005
 
-    # M2a: 从 M1' warm-start, 加 axis reward
+    # M2: 从 M1' warm-start, 加 axis reward, 直接收到 0.2
     python scripts/train_sac.py --no_wandb \\
         --load_agent results/best_agent_M1p_32dim_pos10cm.msh \\
         --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
-        --rew_axis 1.0 --success_axis_threshold 0.5
-
-    # M2b: 从 M2a 收紧
-    python scripts/train_sac.py --no_wandb \\
-        --load_agent results/best_agent_M2a_axis05.msh \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
+        --rew_home 0.0005 \\
         --rew_axis 1.0 --success_axis_threshold 0.2
 
 注意: num_envs=1 触发 IsaacSim cloner 的 `*` pattern 失败 → 至少 2.
@@ -95,17 +91,17 @@ def parse_args():
                    help="覆盖 env 的 per-step success bonus (默认 2.0)")
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重 (默认 0.0 = M1' pos-only). "
-                        "M2a/M2b 设 1.0 启用轴对齐惩罚.")
+                        "M2 设 1.0 启用轴对齐惩罚.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
                    help="覆盖 env 的 axis_err success 阈值 (默认 inf = M1' 不检查 axis). "
-                        "M2a 用 0.5, M2b 用 0.2. 接受 'inf' 字符串.")
+                        "M2 用 0.2. 接受 'inf' 字符串.")
     p.add_argument("--load_agent", type=str, default=None,
                    help="warm-start 路径: 从该 checkpoint 加载 agent (actor/critic/"
                         "optimizer state). obs 维度必须匹配; 31 维 M1 老 checkpoint "
                         "不能加载到 32 维 env, 先重训 M1'.")
     p.add_argument("--keep_replay", action="store_true",
                    help="warm-start 时保留旧 replay buffer. 默认会清空 — 因为 stage "
-                        "切换 (M1'→M2a, M2a→M2b) reward 函数变了, 旧 transitions 的 "
+                        "切换 (M1'→M2) reward 函数变了, 旧 transitions 的 "
                         "reward 标签按旧 reward 算, 留着会拖 critic.")
     p.add_argument("--terminal_hold_bonus", type=float, default=None,
                    help="hold-N 步成功后的终结 bonus + episode 终止. "
@@ -190,7 +186,7 @@ def main():
             raise FileNotFoundError(f"--load_agent 路径不存在: {load_path}")
         agent = Agent.load(str(load_path))
         print(f"[WARM-START] 已加载 agent from {load_path}")
-        # 默认清空 replay buffer: stage 切换 (M1'→M2a, M2a→M2b) reward 函数变了,
+        # 默认清空 replay buffer: stage 切换 (M1'→M2) reward 函数变了,
         # 旧 transitions 的 reward 标签按旧 reward 算的, 留下来会拖 critic. 仅在
         # 用户显式 --keep_replay 时保留.
         if not args.keep_replay:

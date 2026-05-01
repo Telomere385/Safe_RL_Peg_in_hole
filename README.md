@@ -17,13 +17,13 @@ hole_entry + 5cm · hole_axis`. Step 2 内部用 stage flag 进一步切档:
 ```
               rew_axis    success_axis_threshold     语义
 M1'  pos-only  0.0          inf                       (32 维 baseline, 等价老 strict-pos-only)
-M2a  pos+粗轴  1.0          0.5                       (≈ ±60° 锥)
-M2b  pos+紧轴  1.0          0.2                       (≈ ±37° 锥)
+M2   pos+轴    1.0          0.2                       (≈ ±37° 锥, 直接到 final 阈值)
 ```
 
 `success_axis_threshold = inf` 时 success_mask 退化成 pos-only, `-w_axis · axis_err`
 在 `rew_axis = 0` 时为 0 — 同一个 env、同一个 32 维 obs、同一条 reward 骨架,
-M1' → M2a → M2b 之间 `--load_agent` warm-start 不需要重训.
+M1' → M2 之间 `--load_agent` warm-start 不需要重训. (历史上 M2 拆成 M2a 0.5 + M2b 0.2
+两段, 现在 M1' 收敛后直接收到 0.2 即可, 拆段没有显著收益.)
 
 peg/hole frame 用解析式 (`EE_pose ⊗ const_offset`) 不依赖 XFormPrim 的 Fabric flush,
 headless 训练永不 stale.
@@ -139,7 +139,7 @@ pos 和 axis 都进.
 
 ## 训练 / 评估命令
 
-三阶段 curriculum, 每一阶段从上一阶段 checkpoint warm-start:
+两阶段 curriculum, M2 从 M1' checkpoint warm-start:
 
 ```bash
 # Step 1 / M1': 32 维 baseline (axis 项关闭). reset 时 pos_err≈0.5-1m,
@@ -150,26 +150,22 @@ python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --rew_home 0.0005
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
-# Step 2a / M2a: 加 axis reward (粗对齐, ±60° 锥)
+# Step 2 / M2: pos + axis 一步到 ±37° 锥 (axis_th=0.2)
+# 如果前 50 epoch hold_success_rate 一直是 0 / axis_err_mean 没下降, 临时
+# warmup --success_axis_threshold 0.5 跑短一些, 但不作为正式 stage.
 python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --load_agent results/best_agent_M1p_32dim_pos10cm.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
-    --rew_axis 1.0 --success_axis_threshold 0.5
-cp results/best_agent.msh results/best_agent_M2a_axis05.msh
-
-# Step 2b / M2b: 收紧到 ±37° 锥
-python scripts/train_sac.py --no_wandb --n_epochs 150 \
-    --load_agent results/best_agent_M2a_axis05.msh \
-    --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
-    --rew_home 0.0005 \
     --rew_axis 1.0 --success_axis_threshold 0.2
+cp results/best_agent.msh results/best_agent_M2_axis02.msh
 
 # 评估 (CLI 必须与训练一致, 否则 success 触发条件不同, 数字不可比)
 python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \
+    --agent_path results/best_agent_M2_axis02.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
-    --rew_axis 1.0 --success_axis_threshold 0.5
+    --rew_axis 1.0 --success_axis_threshold 0.2
 ```
 
 `--load_agent` 默认会清空 replay buffer (旧 reward 标签不能带过来), 加 `--keep_replay`
@@ -206,9 +202,9 @@ python scripts/archive/check_peghole_asset.py \
 | `--initial_joint_noise` | env=0.1 | reset 时关节角的 ±范围 |
 | `--preinsert_success_pos_threshold` | env=0.10 | success 的 pos_err 阈值 (m) |
 | `--preinsert_offset` | env=0.05 | hole_entry 沿 hole_axis 的 preinsert 距离 (m) |
-| `--rew_axis` | env=0.0 | axis_err 权重. M1' 用 0, M2a/M2b 用 1.0 |
+| `--rew_axis` | env=0.0 | axis_err 权重. M1' 用 0, M2 用 1.0 |
 | `--rew_home` | env=0.0 | home regularizer 权重. 0 = 关闭; 起步 0.0005 当极弱 tie-breaker |
-| `--success_axis_threshold` | env=inf | axis_err 的 success 阈值. M1' inf, M2a 0.5, M2b 0.2 |
+| `--success_axis_threshold` | env=inf | axis_err 的 success 阈值. M1' inf, M2 0.2 |
 | `--terminal_hold_bonus` | env=0.0 | hold-N 软 absorbing bonus, =0 关闭机制 |
 | `--hold_success_steps` | 10 | 连续 N 步 in-threshold 才算 success (≈1s) |
 | `--clearance_hard` | env=0.0 | sphere proxy 自碰撞兜底阈值. 0 = 球壳触碰即碰撞, `--clearance_hard=-inf` = 关闭 |
@@ -273,7 +269,7 @@ python scripts/archive/check_peghole_asset.py \
   (默认直接取 `num_envs`).
 - success 不做 absorbing — 只给每步 dwell bonus, 避免边界 hugging Q-target 断崖.
   要切 hold-N absorbing, `--terminal_hold_bonus > 0`.
-- **stage 切换 (M1' → M2a → M2b) 默认清空 replay buffer**: 旧 transitions 的 reward
+- **stage 切换 (M1' → M2) 默认清空 replay buffer**: 旧 transitions 的 reward
   标签按旧 reward 算的, 留下来会拖 critic. 显式 `--keep_replay` 可保留 (debug 用).
 - peg/hole 是**视觉 only**: 不产生接触力, 也不会触发 `arm_L`/`arm_R` collision
   group. Step 4 才会给 peg 加 `CollisionAPI` 并设计 collision group.

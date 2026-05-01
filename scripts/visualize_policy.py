@@ -6,7 +6,7 @@ preinsert"那一帧. 这里通过 monkey-patch is_absorbing, 让 env 在指定 e
 计数器达到 hold-N 时调 _world.render() 反复刷, 不调 _world.step(), 物理就冻住了.
 
 stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mask =
-(pos<pos_th) ∧ (axis_err<axis_th). M2a/M2b 评估时**必须**传 --rew_axis 和
+(pos<pos_th) ∧ (axis_err<axis_th). M2 评估时**必须**传 --rew_axis 和
 --success_axis_threshold 与训练时一致, 否则 axis_th=inf 会让 freeze 在"位置
 进阈但姿态没达标"时误触发, 看到的不是 M2 真正的成功状态.
 
@@ -15,10 +15,10 @@ stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mas
     # M1' 视觉验证
     python scripts/visualize_policy.py --preinsert_success_pos_threshold 0.10
 
-    # M2a 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.5)
+    # M2 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.2)
     python scripts/visualize_policy.py \\
         --preinsert_success_pos_threshold 0.10 \\
-        --rew_axis 1.0 --success_axis_threshold 0.5
+        --rew_axis 1.0 --success_axis_threshold 0.2
 
     python scripts/visualize_policy.py --freeze_seconds 30
     python scripts/visualize_policy.py --viz_env_idx 1
@@ -60,7 +60,7 @@ def parse_args():
                    help="覆盖 env 的 axis_err 权重. visualize 不算 reward, 但保留 "
                         "CLI 一致性 (env 内部根据这个值打印的 axis 项形式不同).")
     p.add_argument("--success_axis_threshold", type=float, default=None,
-                   help="**必须与 train 一致**. M2a 用 0.5, M2b 用 0.2. 不传 = "
+                   help="**必须与 train 一致**. M2 用 0.2. 不传 = "
                         "默认 inf = M1' 行为, 会让 freeze 在 axis 还没对齐时误触发.")
     p.add_argument("--hold_steps", type=int, default=10,
                    help="连续 N 步在阈内即冻结. 默认 10 = 跟 train 的 hold_success_steps 一致")

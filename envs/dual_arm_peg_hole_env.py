@@ -2,13 +2,12 @@
 
 阶段 (stage flag 化, 同一个 env / 同一个 obs / 同一条 reward 骨架):
     M1' = pos-only           rew_axis=0,    success_axis_threshold=inf
-    M2a = pos + 粗轴对齐      rew_axis=1.0,  success_axis_threshold=0.5
-    M2b = pos + 紧轴对齐      rew_axis=1.0,  success_axis_threshold=0.2
+    M2  = pos + axis 对齐    rew_axis=1.0,  success_axis_threshold=0.2
     M3+ = 在 obs 里再加
           radial/axial 维度 (留给后续 commit, 此版本不放).
 
 切换 stage 不改 env 结构, 只改 reward 权重和 success_axis_threshold. 这样
-M1' → M2a → M2b 之间可以 warm-start (--load_agent), 网络输入维度恒为 32.
+M1' → M2 之间可以 warm-start (--load_agent), 网络输入维度恒为 32.
 
 每臂控全部 7 DoF (A1-A7), 14 维 joint velocity 动作.
 
@@ -158,7 +157,7 @@ HOLE_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 
 # Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper
 # (obs_helper 的 idx_map 对应 raw obs 而非 agent obs).
-# 32 维布局对所有 stage (M1' / M2a / M2b) 通用; M3+ 才会再加 radial/axial 维度.
+# 32 维布局对所有 stage (M1' / M2) 通用; M3+ 才会再加 radial/axial 维度.
 _AGENT_OBS_JOINT_POS = slice(0, 14)
 _AGENT_OBS_JOINT_VEL = slice(14, 28)
 _AGENT_OBS_POS_VEC = slice(28, 31)
@@ -207,7 +206,7 @@ class DualArmPegHoleEnv(IsaacSim):
         self._r_min = reward_absorbing_r_min
         self._reward_scale = reward_scale
         self._w_pos = rew_pos
-        # rew_axis 默认 0 = M1' 行为 (axis 项消失). M2a/M2b 通过 CLI 打开.
+        # rew_axis 默认 0 = M1' 行为 (axis 项消失). M2 通过 CLI 打开.
         self._w_axis = rew_axis
         self._w_success = rew_success
         self._w_joint_limit = rew_joint_limit
@@ -446,7 +445,7 @@ class DualArmPegHoleEnv(IsaacSim):
 
         success 用 stage flag 控制:
             success_axis_threshold=inf 时 axis 项恒 True, 退化为 pos-only (M1' 行为).
-            success_axis_threshold=0.5/0.2 时变成 pos ∧ axis (M2a/M2b).
+            success_axis_threshold=0.2 时变成 pos ∧ axis (M2).
         """
         pos_vec = agent_obs[..., _AGENT_OBS_POS_VEC]
         pos_err = torch.norm(pos_vec, dim=-1)
