@@ -295,6 +295,8 @@ def main():
     use_J_for_best = mdp._terminal_hold_bonus > 0
     total_env_steps = INITIAL_REPLAY_SIZE
     absorb_prev = mdp._absorb_count
+    absorb_physx_prev = mdp._absorb_count_physx
+    absorb_sphere_prev = mdp._absorb_count_sphere
     for epoch in range(args.n_epochs):
         core.learn(
             n_steps=args.n_steps_per_epoch,
@@ -308,6 +310,8 @@ def main():
         total_env_steps += args.n_steps_per_epoch
 
         absorb_epoch = mdp._absorb_count - absorb_prev
+        absorb_physx_epoch = mdp._absorb_count_physx - absorb_physx_prev
+        absorb_sphere_epoch = mdp._absorb_count_sphere - absorb_sphere_prev
 
         with deterministic_policy(agent):
             dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
@@ -334,9 +338,13 @@ def main():
             agent.save(str(results_dir / "best_agent.msh"))
 
         absorb_prev = mdp._absorb_count
+        absorb_physx_prev = mdp._absorb_count_physx
+        absorb_sphere_prev = mdp._absorb_count_sphere
 
         logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J, best_score=best_score,
-                          absorb_epoch=absorb_epoch)
+                          absorb_epoch=absorb_epoch,
+                          absorb_physx=absorb_physx_epoch,
+                          absorb_sphere=absorb_sphere_epoch)
         logger.info("eval stats: "
                     f"hold_success_rate={m['hold_success_rate']:.3f} "
                     f"(>= {args.hold_success_steps} consecutive steps)  "
@@ -358,6 +366,8 @@ def main():
                 "eval_axis_err_mean": m["axis_err_mean"],
                 "alpha": agent._alpha.item(),
                 "absorb_per_epoch": absorb_epoch,
+                "absorb_physx_per_epoch": absorb_physx_epoch,
+                "absorb_sphere_per_epoch": absorb_sphere_epoch,
             }, step=epoch + 1)
 
     logger.info(f"训练完成. best J = {best_J:.3f}  best_score = {best_score:.3f}")

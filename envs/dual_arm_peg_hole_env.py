@@ -294,8 +294,14 @@ class DualArmPegHoleEnv(IsaacSim):
         self._cj = cj
         self._robots = robots
 
-        # 累计自碰撞终止次数 (train_sac 每 epoch 读取并差分)
+        # 累计自碰撞终止次数 (train_sac 每 epoch 读取并差分).
+        # _absorb_count       — 总数 (任一信号触发, 反映 episode 终止次数)
+        # _absorb_count_physx — PhysX 力检测触发数
+        # _absorb_count_sphere— sphere-proxy clearance 触发数
+        # PhysX 与 sphere 可同步触发, 所以 physx + sphere ≥ total.
         self._absorb_count = 0
+        self._absorb_count_physx = 0
+        self._absorb_count_sphere = 0
 
         # hold-N 计数器 (per env)
         self._consecutive_inthresh = torch.zeros(
@@ -434,6 +440,10 @@ class DualArmPegHoleEnv(IsaacSim):
         else:
             sphere_collision = torch.zeros_like(physx_collision)
         collision = physx_collision | sphere_collision
+        # 两个 bucket 可同时触发 (一步同时撞), 分别累加便于诊断哪个信号在主导;
+        # _absorb_count 仍按 OR 后的 collision 累加 (= 实际 absorb 次数).
+        self._absorb_count_physx += int(physx_collision.sum().item())
+        self._absorb_count_sphere += int(sphere_collision.sum().item())
         self._absorb_count += int(collision.sum().item())
         self._last_collision_mask = collision
 
