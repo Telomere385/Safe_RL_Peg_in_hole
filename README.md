@@ -91,8 +91,8 @@ environment.yml
   的梯度给出来; 完整向量与 EE quat 强冗余, 徒增维度. radial / axial 分量留到 Step 3+.
 - **Peg / Hole frame** (env-local, 解析式):
   ```
-  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, 0, 0.160)
-  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, 0, 0.155)
+  peg_tip   = LeftEE_pos  + R(LeftEE_quat)  · (-0.0055, 0, 0.190)
+  hole_entry= RightEE_pos + R(RightEE_quat) · (-0.0055, 0, 0.185)
   peg_axis  =                R(LeftEE_quat)  · (0, 0, +1)
   hole_axis =                R(RightEE_quat) · (0, 0, +1)
   ```

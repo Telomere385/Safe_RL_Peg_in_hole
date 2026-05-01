@@ -118,9 +118,10 @@ RIGHT_EE_PROXY_BODY_NAMES = [
     "right_hande_robotiq_hande_coupler",
     "right_hande_robotiq_hande_link",
 ]
-# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin), ee 3cm (hande_link ~4-6cm).
+# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin),
+# ee 4cm (coupler + hande_link 整体宽度 ~6-8cm, 比起 finger 段 mass 更紧凑).
 ARM_PROXY_RADIUS = 0.06
-EE_PROXY_RADIUS = 0.03
+EE_PROXY_RADIUS = 0.04
 
 # Peg/Hole 几何与挂载常量 — 必须与 build_peghole_usd.py 保持一致.
 # 新约定 (Step 2 重新设计):
@@ -129,7 +130,9 @@ EE_PROXY_RADIUS = 0.03
 #   peg_tip 在 Peg 局部 = (0, 0, +PEG_HEIGHT/2)
 #   所以 peg_tip 在 LeftEE 帧:  (PART_X, 0, PART_Z + PEG_HEIGHT/2)
 _PART_X = -0.0055
-_PART_Z = 0.125
+# PART_Z: peg/hole 局部坐标原点沿 EE +Z 的偏移. 0.155 让 peg/hole 后端坐在 finger
+# 末端 (~z=0.12), finger 只夹住零件最后端 ~3cm, 前段全部伸出.
+_PART_Z = 0.155
 # 2× 放大 (Step 2 重设计). hole_outer = 24mm 半径 = 48mm 直径, 给 Robotiq
 # Hande 50mm 开度留 2mm 安全余量. 长宽等比放大保持原始比例.
 _PEG_HEIGHT = 0.070

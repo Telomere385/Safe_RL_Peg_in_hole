@@ -15,7 +15,7 @@ Peg 和 Hole 是视觉-only 子节点, 没有 RigidBodyAPI / MassAPI / Collision
     /bh_robot/right_hande_robotiq_hande_link/Hole
     /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
 
-挂载: translate=(-0.0055, 0, 0.125), orient=identity (轴沿 EE +Z = 夹爪前方).
+挂载: translate=(-0.0055, 0, 0.155), orient=identity (轴沿 EE +Z = 夹爪前方).
 几何: PEG radius=0.016, height=0.07;
       HOLE outer_r=0.024, inner_r=0.02, height=0.06.
 """
@@ -29,7 +29,7 @@ def Xform "bh_robot" (
     {
         def Xform "Peg"
         {
-            float3 xformOp:translate = (-0.005500, 0.000000, 0.125000)
+            float3 xformOp:translate = (-0.005500, 0.000000, 0.155000)
             quatf xformOp:orient = (1.00000000, 0.00000000, 0.0, 0.0)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
 
@@ -53,7 +53,7 @@ def Xform "bh_robot" (
     {
         def Xform "Hole"
         {
-            float3 xformOp:translate = (-0.005500, 0.000000, 0.125000)
+            float3 xformOp:translate = (-0.005500, 0.000000, 0.155000)
             quatf xformOp:orient = (1.00000000, 0.00000000, 0.0, 0.0)
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
 

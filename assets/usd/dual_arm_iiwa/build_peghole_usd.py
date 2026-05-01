@@ -51,7 +51,8 @@ HOLE_HEIGHT  = 0.060
 
 # 挂载偏移 (EE 本地帧, 应用 orient 之前) --------------------------------------
 PART_X = -0.0055   # 补偿夹爪 mimic 不对称的横向微偏
-PART_Z =  0.125    # 指间区域中心沿 EE 局部 +Z 的距离
+PART_Z =  0.155    # 沿 EE +Z 的偏移; 让零件后端坐在 finger 末端,
+                   # finger 只夹住最后 ~3cm, 前段全部伸出.
 
 # identity orient: quat (w, x, y, z) = (1, 0, 0, 0). 不再做 R_x(+90°), 让
 # peg/hole 的 local +Z 直接对齐 EE +Z (夹爪正前方).
