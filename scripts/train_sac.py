@@ -71,8 +71,10 @@ def parse_args():
     p.add_argument("--lr_actor", type=float, default=3e-4)
     p.add_argument("--lr_critic", type=float, default=3e-4)
     p.add_argument("--lr_alpha", type=float, default=3e-4)
-    p.add_argument("--alpha_max", type=float, default=0.2,
-                   help="alpha 上限, 抑制高维动作下 entropy 奖励压过任务 reward")
+    p.add_argument("--alpha_max", type=float, default=0.1,
+                   help="alpha 上限, 抑制高维动作下 entropy 奖励压过任务 reward. "
+                        "0.2 在 M1' 测过会 collapse (alpha 顶到 cap 时探索压过利用), "
+                        "0.1 更稳.")
     p.add_argument("--target_entropy", type=float, default=None,
                    help="目标 entropy. 默认自动取 -act_dim (SAC 标准设置)")
     p.add_argument("--n_eval_episodes", type=int, default=None,

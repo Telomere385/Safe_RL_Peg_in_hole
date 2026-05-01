@@ -142,20 +142,21 @@ pos 和 axis 都进.
 三阶段 curriculum, 每一阶段从上一阶段 checkpoint warm-start:
 
 ```bash
-# Step 1 / M1': 32 维 baseline (axis 项关闭)
-python scripts/train_sac.py --no_wandb --n_epochs 100 \
+# Step 1 / M1': 32 维 baseline (axis 项关闭). reset 时 pos_err≈0.5-0.7m,
+# 需要 ~200 epochs 收敛, 再短容易在找到 success region 之后忘掉.
+python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
 # Step 2a / M2a: 加 axis reward (粗对齐, ±60° 锥)
-python scripts/train_sac.py --no_wandb --n_epochs 150 \
+python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --load_agent results/best_agent_M1p_32dim_pos10cm.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_axis 1.0 --success_axis_threshold 0.5
 cp results/best_agent.msh results/best_agent_M2a_axis05.msh
 
 # Step 2b / M2b: 收紧到 ±37° 锥
-python scripts/train_sac.py --no_wandb --n_epochs 100 \
+python scripts/train_sac.py --no_wandb --n_epochs 150 \
     --load_agent results/best_agent_M2a_axis05.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_axis 1.0 --success_axis_threshold 0.2

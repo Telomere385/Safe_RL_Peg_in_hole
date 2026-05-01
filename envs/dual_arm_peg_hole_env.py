@@ -78,13 +78,14 @@ ARM_JOINTS = LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS  # 14
 
 # Home pose — 取代 USD 自带的 zero 默认位姿. 双臂在胸前略弯肘的 ready 姿态,
 # 让 reset center 落在任务相关区域, 减少 M1' 早期探索的无效扇区.
-# 镜像约定: 奇数 joint (绕"竖向"轴) 取反, 偶数 joint (hinge) 同号. 镜像若不对
-# (右臂方向反了 / 甩出去), 调换 A1 正负号通常即可.
+# 镜像约定 (实测 dual_arm_iiwa USD): A1 同号, A3 / A7 取反 — 第一次猜的
+# "奇数 joint 全取反" 在 right_A1 上不成立, 会让两夹爪 +Z 同向 (axis_err=1.99)
+# 而非对面. 当前值已使两侧 +Z 互指 (axis_dot ≈ -1).
 HOME_JOINT_POS = (
     # left arm  A1     A2      A3      A4     A5   A6   A7
     -2.568,  -0.250, -0.078,  0.814,  0.0, 0.0,  0.010,
     # right arm A1     A2      A3      A4     A5   A6   A7
-    +2.568,  -0.250, +0.078,  0.814,  0.0, 0.0, -0.010,
+    -2.568,  -0.250, +0.078,  0.814,  0.0, 0.0, -0.010,
 )
 assert len(HOME_JOINT_POS) == 14, "HOME_JOINT_POS 必须 14 维 (左 7 + 右 7)"
 
