@@ -55,6 +55,14 @@ def parse_args():
     p.add_argument("--n_resets", type=int, default=1,
                    help="进入主可视化循环前采样多少次 reset, 用来打印 preinsert "
                         "误差在 reset 分布下的统计. n_resets=1 = 单次 reset.")
+    p.add_argument("--show_spheres", default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help="是否画双臂 sphere proxy (38 个半透明球, 左橙右蓝). "
+                        "用来肉眼判断 home pose 下 reset 余量, 默认开. 关用 --no-show-spheres.")
+    p.add_argument("--hold_pose", default=True,
+                   action=argparse.BooleanOptionalAction,
+                   help="主循环每帧 kinematic 重写 joint_pos = HOME, 防止重力下沉. "
+                        "默认开. 想看自然 dynamics 用 --no-hold-pose.")
     return p.parse_args()
 
 
@@ -127,6 +135,59 @@ def _spawn_preinsert_markers(axis_length=0.10, axis_radius=0.004, sphere_radius=
     return {"peg_t": peg_t, "peg_r": peg_r,
             "hole_t": hole_t, "hole_r": hole_r,
             "pre_t": pre_t}
+
+
+def _spawn_sphere_proxy_markers(mdp):
+    """每侧 19 球 (与 env._compute_min_clearance 一致), 半透明, 左橙右蓝.
+
+    返回 {"left": [t_op, ...], "right": [t_op, ...]} 用于每帧 update.
+    """
+    try:
+        import omni.usd
+        from pxr import UsdGeom, Sdf, Gf, Vt
+    except ImportError:
+        return None
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return None
+    radii = mdp._proxy_radii_per_side.detach().cpu().tolist()
+
+    def _make(path, color, opacity, radius):
+        sphere = UsdGeom.Sphere.Define(stage, Sdf.Path(path))
+        sphere.GetRadiusAttr().Set(float(radius))
+        sphere.GetDisplayColorAttr().Set(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+        sphere.GetDisplayOpacityAttr().Set([float(opacity)])
+        xf = UsdGeom.Xformable(sphere.GetPrim())
+        xf.ClearXformOpOrder()
+        t_op = xf.AddTranslateOp()
+        t_op.Set(Gf.Vec3d(0.0, 0.0, 10.0))   # park 远处, 等 update 写真位置
+        return t_op
+
+    left = [_make(f"/World/viz/sphere_left_{i:02d}",
+                  (1.0, 0.55, 0.20), 0.25, r)
+            for i, r in enumerate(radii)]
+    right = [_make(f"/World/viz/sphere_right_{i:02d}",
+                   (0.25, 0.55, 1.0), 0.25, r)
+             for i, r in enumerate(radii)]
+    print(f"[VIS SPHERES] spawned {len(left)+len(right)} sphere proxy markers "
+          f"(left=橙, right=蓝, opacity=0.25)")
+    return {"left": left, "right": right}
+
+
+def _update_sphere_proxy_markers(mdp, sphere_handles, env_idx, env_offset_world):
+    if sphere_handles is None:
+        return
+    from pxr import Gf
+    _, info = mdp._compute_min_clearance()
+    left_p = info["left_proxies"][env_idx].detach().cpu()    # [19, 3]
+    right_p = info["right_proxies"][env_idx].detach().cpu()
+    ox, oy, oz = env_offset_world
+    for i, t_op in enumerate(sphere_handles["left"]):
+        x, y, z = left_p[i].tolist()
+        t_op.Set(Gf.Vec3d(x + ox, y + oy, z + oz))
+    for i, t_op in enumerate(sphere_handles["right"]):
+        x, y, z = right_p[i].tolist()
+        t_op.Set(Gf.Vec3d(x + ox, y + oy, z + oz))
 
 
 def _update_preinsert_markers(frames, handles, env_idx, env_offset_world):
@@ -290,6 +351,7 @@ def main():
 
     mdp._world.step(render=True)
     handles = _spawn_preinsert_markers()
+    sphere_handles = _spawn_sphere_proxy_markers(mdp) if args.show_spheres else None
     # env_pos: cloned env 的世界 base 偏移. frames 是 env-local, marker 在 /World/viz/...
     # 必须加这个偏移才能落在 viz_env_idx 指定的那个 env 上.
     env_offset_world = tuple(
@@ -300,18 +362,31 @@ def main():
     errors = mdp._compute_preinsert_errors(frames)
     _print_preinsert_frames(frames, errors, args.viz_env_idx)
     _update_preinsert_markers(frames, handles, args.viz_env_idx, env_offset_world)
+    _update_sphere_proxy_markers(mdp, sphere_handles, args.viz_env_idx, env_offset_world)
 
     if args.duration <= 0:
         print("[VIS] 窗口已打开. 观察完后按 Ctrl-C 退出.")
     else:
         print(f"[VIS] 窗口将保持 {args.duration:.1f}s.")
+    if args.hold_pose:
+        print("[VIS] hold_pose=on: 每帧 kinematic 重写 joint_pos=HOME, 关闭重力下沉.")
+
+    # hold_pose: 每帧把 14 个关节角直接写回 HOME, 抵消重力 + kp=0 的下沉.
+    # 走 _write_data 是 kinematic 直写, 不走 dynamics, 所以重力拉不动.
+    hold_pos = mdp._default_joint_pos.unsqueeze(0).expand(args.num_envs, -1).contiguous()
+    zero_vel = torch.zeros_like(hold_pos)
+    env_indices = list(range(args.num_envs))
 
     start_t = time.monotonic()
     try:
         while True:
+            if args.hold_pose:
+                mdp._write_data("joint_pos", hold_pos, env_indices)
+                mdp._write_data("joint_vel", zero_vel, env_indices)
             mdp._world.step(render=True)
             frames = mdp.get_preinsert_frames()
             _update_preinsert_markers(frames, handles, args.viz_env_idx, env_offset_world)
+            _update_sphere_proxy_markers(mdp, sphere_handles, args.viz_env_idx, env_offset_world)
             if args.duration > 0 and time.monotonic() - start_t >= args.duration:
                 break
             time.sleep(args.idle_dt)
