@@ -242,6 +242,7 @@ def main():
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
                 f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
+                f"w_home={mdp._w_home:.4f}  "
                 f"preinsert_offset={mdp._preinsert_offset:.3f}m")
     if args.load_agent is not None:
         logger.info(f"warm-start: {args.load_agent}")

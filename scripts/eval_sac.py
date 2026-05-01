@@ -50,6 +50,8 @@ def parse_args():
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重. **eval 不算 reward 主项, 但 visualize 会读**, "
                         "保留 CLI 一致性. 默认 0 = M1' 行为.")
+    p.add_argument("--rew_home", type=float, default=None,
+                   help="覆盖 env 的 home regularizer 权重. 评估 J/R 时应与 train 一致.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
                    help="覆盖 env 默认 axis_err success 阈值. **必须与 train 时一致**, "
                         "否则 hold_success_rate / final_in_thresh_rate 数字不可比.")
@@ -80,7 +82,7 @@ def main():
 
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_axis", "success_axis_threshold",
+                "preinsert_offset", "rew_axis", "rew_home", "success_axis_threshold",
                 "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
