@@ -102,17 +102,23 @@ RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
 # clearance = ||c_L - c_R|| - r_L - r_R, 取 min. 这是 PhysX 接触力检测之外的
 # 几何 proxy, 用于阻止双臂 cross-over (PhysX 力检测在 1cm-5cm 边缘失明).
 #
-# 每侧 15 球 = 8 关节球 (link_0..link_7) + 7 中点球 (相邻 link 直线中点).
+# 每侧 17 球 = 8 关节球 (link_0..link_7) + 7 中点球 (相邻 link 直线中点)
+#            + 2 EE 球 (coupler, hande_link). finger 球去掉 — 它们在 peg/hole
+#            视觉前面, 容易和零件重叠误触发, 而且 finger ↔ finger 不是 cross-over
+#            关键区 (cross-over 主要发生在 link / hande_link 段).
 # 中点用 0.5*(BODY_POS[i] + BODY_POS[i+1]); iiwa link 大体直筒, 直线中点
 # 与 mesh 几何中心差距小, 不需要查 inertial / visual mesh, 完全只读 BODY_POS.
-# 夹爪段 (coupler / hande_link / fingers) 不放 sphere — peg/hole 在它们前面
-# 伸出, 把球放到夹爪上会和 peg/hole 视觉重叠且本身不是 cross-over 关键区.
 LEFT_ARM_JOINT_BODY_NAMES = [f"left_arm_link_{i}" for i in range(0, 8)]   # 8 球
 RIGHT_ARM_JOINT_BODY_NAMES = [f"right_arm_link_{i}" for i in range(0, 8)]
-LEFT_EE_PROXY_BODY_NAMES: list[str] = []
-RIGHT_EE_PROXY_BODY_NAMES: list[str] = []
-# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin). EE 半径已无 sphere 使用,
-# 但保留参数防止外部 CLI 透传报错.
+LEFT_EE_PROXY_BODY_NAMES = [
+    "left_hande_robotiq_hande_coupler",
+    "left_hande_robotiq_hande_link",
+]
+RIGHT_EE_PROXY_BODY_NAMES = [
+    "right_hande_robotiq_hande_coupler",
+    "right_hande_robotiq_hande_link",
+]
+# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin), ee 3cm (hande_link ~4-6cm).
 ARM_PROXY_RADIUS = 0.06
 EE_PROXY_RADIUS = 0.03
 
