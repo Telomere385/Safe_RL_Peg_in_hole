@@ -126,7 +126,9 @@ def main():
     mdp = DualArmPegHoleEnv(**env_kwargs)
     print(f"[VIZ STAGE] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
           f"axis_th={mdp._success_axis_threshold:.3f}  "
-          f"w_axis={mdp._w_axis:.3f}")
+          f"w_axis={mdp._w_axis:.3f}  "
+          f"w_pos_success={mdp._w_pos_success:.3f}  "
+          f"axis_gate_radius={mdp._axis_gate_radius:.3f}m")
 
     from mushroom_rl.core import Agent, VectorCore
 

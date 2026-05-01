@@ -138,7 +138,7 @@ def _spawn_preinsert_markers(axis_length=0.10, axis_radius=0.004, sphere_radius=
 
 
 def _spawn_sphere_proxy_markers(mdp):
-    """每侧 19 球 (与 env._compute_min_clearance 一致), 半透明, 左橙右蓝.
+    """按 env._proxy_radii_per_side 数量画球, 半透明, 左橙右蓝.
 
     返回 {"left": [t_op, ...], "right": [t_op, ...]} 用于每帧 update.
     """

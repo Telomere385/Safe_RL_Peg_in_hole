@@ -53,8 +53,8 @@ def parse_args():
     p.add_argument("--preinsert_offset", type=float, default=None,
                    help="覆盖 env 默认 preinsert offset. 应传与 train 相同的值")
     p.add_argument("--rew_axis", type=float, default=None,
-                   help="覆盖 env 的 axis_err 权重. **eval 不算 reward 主项, 但 visualize 会读**, "
-                        "保留 CLI 一致性. 默认 0 = M1' 行为.")
+                   help="覆盖 env 的 axis_err 权重. hold 指标不依赖 reward, 但 J/R 会依赖; "
+                        "应与 train 一致. 默认 0 = M1' 行为.")
     p.add_argument("--rew_pos_success", type=float, default=None,
                    help="覆盖 env 的 pos-only success bonus. 应与 train 一致.")
     p.add_argument("--axis_gate_radius", type=float, default=None,

@@ -485,7 +485,7 @@ class DualArmPegHoleEnv(IsaacSim):
     def is_absorbing(self, obs):
         physx_collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
                                                 dt=self._timestep)
-        # sphere-proxy 兜底: 双臂 19 球 vs 19 球的最小 clearance 跌破 clearance_hard
+        # sphere-proxy 兜底: 双臂 sphere proxy 的最小 clearance 跌破 clearance_hard
         # 也算 collision. clearance_hard=-inf 时此项恒 False, 退化为纯 PhysX.
         min_clearance, _ = self._compute_min_clearance()
         self._last_min_clearance = min_clearance
@@ -800,14 +800,14 @@ class DualArmPegHoleEnv(IsaacSim):
     # Sphere-proxy clearance (PhysX 自碰撞兜底, 全 stage 通用)
     # ------------------------------------------------------------------
     def _build_sphere_proxy_indices(self):
-        """从 articulation body_names 解析每侧 19 球需要的 body 索引.
+        """从 articulation body_names 解析每侧 sphere proxy 需要的 body 索引.
 
         构造完成后:
             self._left_arm_joint_idx   [8]   left_arm_link_0..link_7 在 body_names 里的位置
             self._right_arm_joint_idx  [8]
-            self._left_ee_proxy_idx    [4]   coupler / hande_link / l_finger / r_finger
-            self._right_ee_proxy_idx   [4]
-            self._proxy_radii_per_side [19]  arm 段 15 球 + EE 段 4 球, 半径来自 env 参数
+            self._left_ee_proxy_idx    [2]   coupler / hande_link
+            self._right_ee_proxy_idx   [2]
+            self._proxy_radii_per_side [17]  arm 段 15 球 + EE 段 2 球, 半径来自 env 参数
         """
         body_names = list(self._task.robots.body_names)
 
@@ -833,25 +833,25 @@ class DualArmPegHoleEnv(IsaacSim):
         self._right_ee_proxy_idx = torch.as_tensor(
             _resolve_all(RIGHT_EE_PROXY_BODY_NAMES), device=device, dtype=torch.long
         )
-        # 每侧 19 球的半径 (顺序: 8 关节 + 7 中点 + 4 EE)
+        # 每侧 17 球的半径 (顺序: 8 关节 + 7 中点 + 2 EE)
         n_arm = len(LEFT_ARM_JOINT_BODY_NAMES)     # 8
         n_mid = n_arm - 1                          # 7 段中点
-        n_ee = len(LEFT_EE_PROXY_BODY_NAMES)       # 4
+        n_ee = len(LEFT_EE_PROXY_BODY_NAMES)       # 2
         radii = torch.empty(n_arm + n_mid + n_ee, device=device, dtype=torch.float32)
         radii[:n_arm + n_mid] = self._proxy_arm_radius
         radii[n_arm + n_mid:] = self._proxy_ee_radius
-        self._proxy_radii_per_side = radii         # [19]
+        self._proxy_radii_per_side = radii         # [17]
         self._n_proxies_per_side = n_arm + n_mid + n_ee
 
     def _gather_side_proxies(self, body_pos, joint_idx, ee_idx):
-        """body_pos: [n_envs, n_bodies, 3] → [n_envs, 19, 3] sphere proxy 球心.
+        """body_pos: [n_envs, n_bodies, 3] → [n_envs, n_proxy, 3] sphere proxy 球心.
 
-        球心顺序: 8 关节 + 7 中点 + 4 EE, 与 self._proxy_radii_per_side 对齐.
+        球心顺序: 8 关节 + 7 中点 + 2 EE, 与 self._proxy_radii_per_side 对齐.
         """
         joints = body_pos[:, joint_idx, :]                   # [n_envs, 8, 3]
         mids = 0.5 * (joints[:, :-1, :] + joints[:, 1:, :])  # [n_envs, 7, 3]
-        ee = body_pos[:, ee_idx, :]                          # [n_envs, 4, 3]
-        return torch.cat([joints, mids, ee], dim=1)          # [n_envs, 19, 3]
+        ee = body_pos[:, ee_idx, :]                          # [n_envs, 2, 3]
+        return torch.cat([joints, mids, ee], dim=1)          # [n_envs, n_proxy, 3]
 
     def _compute_min_clearance(self):
         """sphere-proxy 双臂 clearance, 跨所有 env vectorized.
@@ -865,8 +865,8 @@ class DualArmPegHoleEnv(IsaacSim):
             info: dict
                 "min_pair_left_idx":  [n_envs]  long, 0..18 (球索引 per side)
                 "min_pair_right_idx": [n_envs]  long
-                "left_proxies":  [n_envs, 19, 3]  球心位置 (env-local world)
-                "right_proxies": [n_envs, 19, 3]
+                "left_proxies":  [n_envs, n_proxy, 3]  球心位置 (env-local world)
+                "right_proxies": [n_envs, n_proxy, 3]
         """
         physics_view = self._task.robots._physics_view
         xforms = physics_view.get_link_transforms()       # [n_envs, n_bodies, 7] (xyz+quat)
@@ -882,12 +882,12 @@ class DualArmPegHoleEnv(IsaacSim):
         right = self._gather_side_proxies(
             body_pos, self._right_arm_joint_idx, self._right_ee_proxy_idx
         )
-        # [n_envs, 19, 19, 3] → [n_envs, 19, 19] center-to-center
+        # [n_envs, nL, nR, 3] → [n_envs, nL, nR] center-to-center
         diff = left.unsqueeze(2) - right.unsqueeze(1)
         dist = diff.norm(dim=-1)
-        rL = self._proxy_radii_per_side.view(1, -1, 1)    # [1, 19, 1]
-        rR = self._proxy_radii_per_side.view(1, 1, -1)    # [1, 1, 19]
-        clearance = dist - rL - rR                         # [n_envs, 19, 19]
+        rL = self._proxy_radii_per_side.view(1, -1, 1)    # [1, nL, 1]
+        rR = self._proxy_radii_per_side.view(1, 1, -1)    # [1, 1, nR]
+        clearance = dist - rL - rR                         # [n_envs, nL, nR]
 
         n = self._n_proxies_per_side
         flat = clearance.view(self._n_envs, -1)
