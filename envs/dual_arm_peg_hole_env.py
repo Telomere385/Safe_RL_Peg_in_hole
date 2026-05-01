@@ -35,7 +35,10 @@ Reward (统一骨架):
               # axis_th=inf 时退化为 pos-only — 这就是 M1' 的语义
 
 终止:
-    - 自碰撞 (左右臂接触力 > 阈值): 吸收 r = r_min / (1 - γ)
+    - 自碰撞 (双信号 OR, 任一触发即吸收 r = r_min / (1 - γ)):
+        * PhysX 接触力 > collision_force_threshold
+        * sphere-proxy clearance < clearance_hard (PhysX 在 1cm-5cm 边缘失明
+          的几何兜底, 默认 clearance_hard=0.0 即球壳一接触就算碰撞)
     - hold-N (success 连续 N 步): 软 absorbing + terminal_hold_bonus (可选, =0 关闭)
     - success 本身不终止 (沿用 phase 1 结论, 避免 Q-target 边界断崖, 见
       feedback_bimanual_reward_shaping.md Rule 1)
@@ -80,6 +83,33 @@ RIGHT_EE_PATH = "/right_hande_robotiq_hande_link"
 
 LEFT_ARM_GROUP = LEFT_ARM_LINKS + [LEFT_EE_PATH]
 RIGHT_ARM_GROUP = RIGHT_ARM_LINKS + [RIGHT_EE_PATH]
+
+# ---- Sphere-proxy clearance 几何常量 -------------------------------------
+# 把每条机械臂离散成一组球, 球心从 articulation BODY_POS 拿. 两侧球心两两算
+# clearance = ||c_L - c_R|| - r_L - r_R, 取 min. 这是 PhysX 接触力检测之外的
+# 几何 proxy, 用于阻止双臂 cross-over (PhysX 力检测在 1cm-5cm 边缘失明).
+#
+# 每侧 19 球 = 8 关节球 (link_0..link_7) + 7 中点球 (相邻 link 直线中点)
+#            + 4 EE 球 (coupler, hande_link, left_finger, right_finger).
+# 中点用 0.5*(BODY_POS[i] + BODY_POS[i+1]); iiwa link 大体直筒, 直线中点
+# 与 mesh 几何中心差距小, 不需要查 inertial / visual mesh, 完全只读 BODY_POS.
+LEFT_ARM_JOINT_BODY_NAMES = [f"left_arm_link_{i}" for i in range(0, 8)]   # 8 球
+RIGHT_ARM_JOINT_BODY_NAMES = [f"right_arm_link_{i}" for i in range(0, 8)]
+LEFT_EE_PROXY_BODY_NAMES = [
+    "left_hande_robotiq_hande_coupler",
+    "left_hande_robotiq_hande_link",
+    "left_hande_robotiq_hande_left_finger",
+    "left_hande_robotiq_hande_right_finger",
+]
+RIGHT_EE_PROXY_BODY_NAMES = [
+    "right_hande_robotiq_hande_coupler",
+    "right_hande_robotiq_hande_link",
+    "right_hande_robotiq_hande_left_finger",
+    "right_hande_robotiq_hande_right_finger",
+]
+# 半径起步值: arm 6cm (link 直径 ~6-10cm 给 margin), ee 3cm (hande/finger 直径 ~4-6cm).
+ARM_PROXY_RADIUS = 0.06
+EE_PROXY_RADIUS = 0.03
 
 # Peg/Hole 几何与挂载常量 — 必须与 build_peghole_usd.py 保持一致.
 # 推导 (USD 应用顺序: orient 后 translate, 见 build script:
@@ -151,6 +181,12 @@ class DualArmPegHoleEnv(IsaacSim):
         success_axis_threshold=float("inf"),
         joint_limit_margin_frac=0.8,
         preinsert_offset=DEFAULT_PREINSERT_OFFSET,
+        # Sphere-proxy 自碰撞兜底 (PhysX 失明区补丁, 全 stage 通用):
+        #   min_clearance < clearance_hard 时与 PhysX 力 OR, 触发 hard absorbing.
+        #   default 0.0 = 球壳一接触就算碰撞. 设 -inf 即关闭.
+        clearance_hard=0.0,
+        proxy_arm_radius=ARM_PROXY_RADIUS,
+        proxy_ee_radius=EE_PROXY_RADIUS,
         usd_path=None,
     ):
         self._action_scale = action_scale
@@ -176,6 +212,18 @@ class DualArmPegHoleEnv(IsaacSim):
         self._success_axis_threshold = float(success_axis_threshold)
         self._joint_limit_margin_frac = joint_limit_margin_frac
         self._preinsert_offset = float(preinsert_offset)
+        # Sphere-proxy 兜底参数. clearance_hard 允许 -inf (=关闭); 半径必须有限正数.
+        self._clearance_hard = float(clearance_hard)
+        self._proxy_arm_radius = float(proxy_arm_radius)
+        self._proxy_ee_radius = float(proxy_ee_radius)
+        if not (math.isfinite(self._proxy_arm_radius) and self._proxy_arm_radius > 0.0):
+            raise ValueError(
+                f"proxy_arm_radius 必须是有限正数, 传入 {proxy_arm_radius}"
+            )
+        if not (math.isfinite(self._proxy_ee_radius) and self._proxy_ee_radius > 0.0):
+            raise ValueError(
+                f"proxy_ee_radius 必须是有限正数, 传入 {proxy_ee_radius}"
+            )
         self._usd_path = Path(usd_path) if usd_path is not None else DEFAULT_USD_PATH
         if not self._usd_path.is_file():
             raise FileNotFoundError(
@@ -191,6 +239,9 @@ class DualArmPegHoleEnv(IsaacSim):
         self._last_pos_err = None
         self._last_axis_err = None
         self._last_success_mask = None
+        # sphere-proxy clearance: is_absorbing 里每步算并 cache,
+        # _last_min_clearance < clearance_hard 即触发 hard absorbing.
+        self._last_min_clearance = None
         # _preprocess_action → reward 链路里缓存 pre-scale 的 raw action,
         # 用于 L2 惩罚. 这样 w_action 和 action_scale 解耦.
         self._last_raw_action = None
@@ -268,6 +319,10 @@ class DualArmPegHoleEnv(IsaacSim):
 
         # peg/hole 资产存在性 fail-fast 检查 (phase 1.5 commit 2 的 print 降级删除)
         self._verify_peghole_prims_exist()
+
+        # Sphere-proxy 索引 + 半径 tensor 解析. 必须在 super().__init__() 之后,
+        # body_names 才存在. is_absorbing 每步调 _compute_min_clearance().
+        self._build_sphere_proxy_indices()
 
         # 同步一次物理状态, 避免 reset_all 后第一帧 BODY_POS / BODY_ROT 是 stale
         self._world.step(render=False)
@@ -368,8 +423,17 @@ class DualArmPegHoleEnv(IsaacSim):
         return pos_err, axis_err, success_mask
 
     def is_absorbing(self, obs):
-        collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
-                                          dt=self._timestep)
+        physx_collision = self._check_collision("arm_L", "arm_R", self._collision_threshold,
+                                                dt=self._timestep)
+        # sphere-proxy 兜底: 双臂 19 球 vs 19 球的最小 clearance 跌破 clearance_hard
+        # 也算 collision. clearance_hard=-inf 时此项恒 False, 退化为纯 PhysX.
+        min_clearance, _ = self._compute_min_clearance()
+        self._last_min_clearance = min_clearance
+        if math.isfinite(self._clearance_hard):
+            sphere_collision = min_clearance < self._clearance_hard
+        else:
+            sphere_collision = torch.zeros_like(physx_collision)
+        collision = physx_collision | sphere_collision
         self._absorb_count += int(collision.sum().item())
         self._last_collision_mask = collision
 
@@ -648,3 +712,110 @@ class DualArmPegHoleEnv(IsaacSim):
             "radial_err": radial_err,
             "success_mask": success_mask,
         }
+
+    # ------------------------------------------------------------------
+    # Sphere-proxy clearance (PhysX 自碰撞兜底, 全 stage 通用)
+    # ------------------------------------------------------------------
+    def _build_sphere_proxy_indices(self):
+        """从 articulation body_names 解析每侧 19 球需要的 body 索引.
+
+        构造完成后:
+            self._left_arm_joint_idx   [8]   left_arm_link_0..link_7 在 body_names 里的位置
+            self._right_arm_joint_idx  [8]
+            self._left_ee_proxy_idx    [4]   coupler / hande_link / l_finger / r_finger
+            self._right_ee_proxy_idx   [4]
+            self._proxy_radii_per_side [19]  arm 段 15 球 + EE 段 4 球, 半径来自 env 参数
+        """
+        body_names = list(self._task.robots.body_names)
+
+        def _resolve_all(names):
+            missing = [n for n in names if n not in body_names]
+            if missing:
+                raise RuntimeError(
+                    "build_sphere_proxy_indices: body_names 里缺这些 link: "
+                    f"{missing}\navailable: {body_names}"
+                )
+            return [body_names.index(n) for n in names]
+
+        device = self._device
+        self._left_arm_joint_idx = torch.as_tensor(
+            _resolve_all(LEFT_ARM_JOINT_BODY_NAMES), device=device, dtype=torch.long
+        )
+        self._right_arm_joint_idx = torch.as_tensor(
+            _resolve_all(RIGHT_ARM_JOINT_BODY_NAMES), device=device, dtype=torch.long
+        )
+        self._left_ee_proxy_idx = torch.as_tensor(
+            _resolve_all(LEFT_EE_PROXY_BODY_NAMES), device=device, dtype=torch.long
+        )
+        self._right_ee_proxy_idx = torch.as_tensor(
+            _resolve_all(RIGHT_EE_PROXY_BODY_NAMES), device=device, dtype=torch.long
+        )
+        # 每侧 19 球的半径 (顺序: 8 关节 + 7 中点 + 4 EE)
+        n_arm = len(LEFT_ARM_JOINT_BODY_NAMES)     # 8
+        n_mid = n_arm - 1                          # 7 段中点
+        n_ee = len(LEFT_EE_PROXY_BODY_NAMES)       # 4
+        radii = torch.empty(n_arm + n_mid + n_ee, device=device, dtype=torch.float32)
+        radii[:n_arm + n_mid] = self._proxy_arm_radius
+        radii[n_arm + n_mid:] = self._proxy_ee_radius
+        self._proxy_radii_per_side = radii         # [19]
+        self._n_proxies_per_side = n_arm + n_mid + n_ee
+
+    def _gather_side_proxies(self, body_pos, joint_idx, ee_idx):
+        """body_pos: [n_envs, n_bodies, 3] → [n_envs, 19, 3] sphere proxy 球心.
+
+        球心顺序: 8 关节 + 7 中点 + 4 EE, 与 self._proxy_radii_per_side 对齐.
+        """
+        joints = body_pos[:, joint_idx, :]                   # [n_envs, 8, 3]
+        mids = 0.5 * (joints[:, :-1, :] + joints[:, 1:, :])  # [n_envs, 7, 3]
+        ee = body_pos[:, ee_idx, :]                          # [n_envs, 4, 3]
+        return torch.cat([joints, mids, ee], dim=1)          # [n_envs, 19, 3]
+
+    def _compute_min_clearance(self):
+        """sphere-proxy 双臂 clearance, 跨所有 env vectorized.
+
+            clearance_ij = ||c_L_i - c_R_j|| - r_L_i - r_R_j
+            min_clearance = clearance.min over (i, j)  → [n_envs]
+
+        Returns:
+            min_clearance: [n_envs]   每个 env 当前最小双臂 clearance (m).
+                                       <0 表示两侧 sphere proxy 已经穿插.
+            info: dict
+                "min_pair_left_idx":  [n_envs]  long, 0..18 (球索引 per side)
+                "min_pair_right_idx": [n_envs]  long
+                "left_proxies":  [n_envs, 19, 3]  球心位置 (env-local world)
+                "right_proxies": [n_envs, 19, 3]
+        """
+        physics_view = self._task.robots._physics_view
+        xforms = physics_view.get_link_transforms()       # [n_envs, n_bodies, 7] (xyz+quat)
+        xforms_t = torch.as_tensor(xforms, device=self._device, dtype=torch.float32)
+        if xforms_t.dim() == 2:
+            n_bodies = len(self._task.robots.body_names)
+            xforms_t = xforms_t.view(self._n_envs, n_bodies, -1)
+        body_pos = xforms_t[..., :3]                      # [n_envs, n_bodies, 3]
+
+        left = self._gather_side_proxies(
+            body_pos, self._left_arm_joint_idx, self._left_ee_proxy_idx
+        )
+        right = self._gather_side_proxies(
+            body_pos, self._right_arm_joint_idx, self._right_ee_proxy_idx
+        )
+        # [n_envs, 19, 19, 3] → [n_envs, 19, 19] center-to-center
+        diff = left.unsqueeze(2) - right.unsqueeze(1)
+        dist = diff.norm(dim=-1)
+        rL = self._proxy_radii_per_side.view(1, -1, 1)    # [1, 19, 1]
+        rR = self._proxy_radii_per_side.view(1, 1, -1)    # [1, 1, 19]
+        clearance = dist - rL - rR                         # [n_envs, 19, 19]
+
+        n = self._n_proxies_per_side
+        flat = clearance.view(self._n_envs, -1)
+        min_vals, min_flat = flat.min(dim=1)               # [n_envs]
+        left_idx = min_flat // n
+        right_idx = min_flat % n
+
+        info = {
+            "min_pair_left_idx": left_idx,
+            "min_pair_right_idx": right_idx,
+            "left_proxies": left,
+            "right_proxies": right,
+        }
+        return min_vals, info
