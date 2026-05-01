@@ -25,14 +25,17 @@ M1' → M2 之间可以 warm-start (--load_agent), 网络输入维度恒为 32.
     action ∈ [-1,1]^14 → joint velocity 指令 (rad/s), 系数 action_scale.
 
 Reward (统一骨架):
-    - w_pos     * pos_err                             # ||peg_tip - preinsert_target||
-    - w_axis    * axis_err                            # 1 + dot(peg_axis, hole_axis), 0 = ideal
-    - w_joint_limit * joint_limit_norm
-    - w_action  * sum(a_i^2)                          # raw action, 解耦 action_scale
-    - w_home    * sum( ((q-q_home)/joint_range)^2 )   # 全 stage tie-breaker, 偏好胸前 ready
-    + w_success * 1[success]                          # per-step dwell bonus, 不终止
-    success = (pos_err < pos_th) ∧ (axis_err < axis_th)
-              # axis_th=inf 时退化为 pos-only — 这就是 M1' 的语义
+    - w_pos          * pos_err                            # ||peg_tip - preinsert_target||
+    - w_axis * gate  * axis_err                           # gate ∈ [0,1] 按距离门控, 远处不压
+    - w_joint_limit  * joint_limit_norm
+    - w_action       * sum(a_i^2)                         # raw action, 解耦 action_scale
+    - w_home         * sum( ((q-q_home)/joint_range)^2 )  # 全 stage tie-breaker
+    + w_pos_success  * 1[pos_err < pos_th]                # 防 M1'→M2 success 断崖
+    + w_success      * 1[full_success]                    # per-step dwell bonus, 不终止
+    full_success = (pos_err < pos_th) ∧ (axis_err < axis_th)
+                   # axis_th=inf 时退化为 pos-only — M1' 语义
+    gate = clamp((axis_gate_radius - pos_err) / (axis_gate_radius - pos_th), 0, 1)
+                   # axis_gate_radius=inf 时 gate ≡ 1 (不门控, M1' / 旧行为)
 
 终止:
     - 自碰撞 (双信号 OR, 任一触发即吸收 r = r_min / (1 - γ)):
@@ -183,6 +186,7 @@ class DualArmPegHoleEnv(IsaacSim):
         rew_pos=1.0,
         rew_axis=0.0,
         rew_success=2.0,
+        rew_pos_success=0.0,
         rew_joint_limit=0.02,
         rew_action=0.005,
         rew_home=0.0,
@@ -190,6 +194,11 @@ class DualArmPegHoleEnv(IsaacSim):
         terminal_hold_bonus=0.0,
         preinsert_success_pos_threshold=0.10,
         success_axis_threshold=float("inf"),
+        # axis-gate: 把 axis 惩罚按距离门控, 远处不干扰位置学习,
+        #   靠近 preinsert 才打开. inf = 不门控 (全 stage 一直施压).
+        #   推荐 M2 用 0.40m: 离 preinsert 40cm 起开始线性 ramp,
+        #   到 pos_th=0.10m 时 gate 满.
+        axis_gate_radius=float("inf"),
         joint_limit_margin_frac=0.8,
         preinsert_offset=DEFAULT_PREINSERT_OFFSET,
         # Sphere-proxy 自碰撞兜底 (PhysX 失明区补丁, 全 stage 通用):
@@ -209,6 +218,10 @@ class DualArmPegHoleEnv(IsaacSim):
         # rew_axis 默认 0 = M1' 行为 (axis 项消失). M2 通过 CLI 打开.
         self._w_axis = rew_axis
         self._w_success = rew_success
+        # pos-only success bonus: 维持 M1' 已学会的"进 pos 阈值给 +bonus"信号,
+        # 避免 M2 加 axis 后, M1' 成功状态突然失去 success bonus 造成断崖.
+        # full_success (pos ∧ axis) 的 bonus 仍走 _w_success.
+        self._w_pos_success = float(rew_pos_success)
         self._w_joint_limit = rew_joint_limit
         self._w_action = rew_action
         # home regularizer: -w_home · ||(q - q_home) / joint_range||²
@@ -226,6 +239,16 @@ class DualArmPegHoleEnv(IsaacSim):
         self._success_axis_threshold = float(success_axis_threshold)
         self._joint_limit_margin_frac = joint_limit_margin_frac
         self._preinsert_offset = float(preinsert_offset)
+        # axis_gate_radius: 距离阈值, axis 惩罚在 [pos_th, gate_radius] 区间线性
+        # 从 0 ramp 到 1, 区间外 clamp. inf = 不门控 (向后兼容).
+        self._axis_gate_radius = float(axis_gate_radius)
+        if (math.isfinite(self._axis_gate_radius)
+                and self._axis_gate_radius <= float(preinsert_success_pos_threshold)):
+            raise ValueError(
+                f"axis_gate_radius ({self._axis_gate_radius:+.4f}) 必须 > "
+                f"preinsert_success_pos_threshold ({preinsert_success_pos_threshold:+.4f}); "
+                "否则 ramp 区间退化, 门控逻辑无意义."
+            )
         # Sphere-proxy 兜底参数. clearance_hard 允许 -inf (=关闭); 半径必须有限正数.
         self._clearance_hard = float(clearance_hard)
         self._proxy_arm_radius = float(proxy_arm_radius)
@@ -253,6 +276,7 @@ class DualArmPegHoleEnv(IsaacSim):
         self._last_pos_err = None
         self._last_axis_err = None
         self._last_success_mask = None
+        self._last_pos_success_mask = None
         # sphere-proxy clearance: is_absorbing 里每步算并 cache,
         # _last_min_clearance < clearance_hard 即触发 hard absorbing.
         self._last_min_clearance = None
@@ -481,12 +505,11 @@ class DualArmPegHoleEnv(IsaacSim):
         # axis_th=inf (M1') 时 axis 项恒 True, success 退化为 pos-only.
         pos_err = torch.norm(self._cached_pos_vec, dim=-1)
         axis_err = self._cached_axis_err
-        success_mask = (
-            (pos_err < self._preinsert_success_pos_threshold)
-            & (axis_err < self._success_axis_threshold)
-        )
+        pos_in_thresh = pos_err < self._preinsert_success_pos_threshold
+        success_mask = pos_in_thresh & (axis_err < self._success_axis_threshold)
         self._last_pos_err = pos_err
         self._last_axis_err = axis_err
+        self._last_pos_success_mask = pos_in_thresh
         self._last_success_mask = success_mask
 
         # 更新 per-env 的连续 in-threshold 计数
@@ -508,7 +531,8 @@ class DualArmPegHoleEnv(IsaacSim):
         joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
         pos_err = self._last_pos_err
         axis_err = self._last_axis_err
-        success = self._last_success_mask.to(pos_err.dtype)
+        full_success = self._last_success_mask.to(pos_err.dtype)
+        pos_success = self._last_pos_success_mask.to(pos_err.dtype)
 
         # 关节极限软惩罚: 超 margin 才计
         joint_range = self._joint_upper - self._joint_lower
@@ -530,14 +554,26 @@ class DualArmPegHoleEnv(IsaacSim):
         home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
         home_norm = (home_dev ** 2).sum(dim=-1)
 
+        # axis-gate: 远处 (pos_err >= gate_radius) 不施加 axis 压力, 保留 M1'
+        # 学到的位置策略; 进入 [pos_th, gate_radius] 区间后线性 ramp; pos 进阈
+        # 后 gate 满. gate_radius=inf 时 gate 恒 1 (向后兼容, 当前 stage 不门控).
+        if math.isfinite(self._axis_gate_radius):
+            denom = max(self._axis_gate_radius - self._preinsert_success_pos_threshold, 1e-6)
+            axis_gate = ((self._axis_gate_radius - pos_err) / denom).clamp(0.0, 1.0)
+        else:
+            axis_gate = torch.ones_like(pos_err)
+
         # rew_axis=0 时 axis 项消失, 这就是 M1' 行为. M2 通过 CLI 把它打开.
+        # rew_pos_success>0 维持 M1' 已学到的"进 pos 阈值给 bonus"信号 — 避免
+        # M2 加 axis 后, M1' 成功状态 (pos 进但 axis 未达) 突然失去 bonus 造成断崖.
         normal = (
             -self._w_pos * pos_err
-            - self._w_axis * axis_err
+            - self._w_axis * axis_gate * axis_err
             - self._w_joint_limit * joint_limit_norm
             - self._w_action * action_sq
             - self._w_home * home_norm
-            + self._w_success * success
+            + self._w_pos_success * pos_success
+            + self._w_success * full_success
         )
 
         # 三路 reward 选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal

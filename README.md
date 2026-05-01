@@ -106,17 +106,26 @@ environment.yml
 ### Reward (统一骨架)
 
 ```
-- w_pos     · pos_err                          # ||peg_tip - preinsert_target||
-- w_axis    · axis_err                         # 1 + dot(peg_axis, hole_axis), 0 = ideal
-- w_joint_limit · joint_limit_norm             # 软极限, 进 margin 后才计 (default 0.02)
-- w_action  · ||raw a||²                       # pre-scale action, 与 action_scale 解耦 (default 0.005)
-- w_home    · ||(q - q_home) / joint_range||²  # 全 stage tie-breaker, 偏好 home pose (default 0)
-+ w_success · 1[success]                       # per-step dwell bonus, 不终止 (default 2.0)
-success = (pos_err < pos_th) ∧ (axis_err < axis_th)
+- w_pos          · pos_err                         # ||peg_tip - preinsert_target||
+- w_axis · gate  · axis_err                        # axis 项被距离门控, 见下
+- w_joint_limit  · joint_limit_norm                # 软极限, 进 margin 后才计 (default 0.02)
+- w_action       · ||raw a||²                      # pre-scale action, 与 action_scale 解耦 (default 0.005)
+- w_home         · ||(q - q_home) / joint_range||² # tie-breaker (default 0)
++ w_pos_success  · 1[pos_err < pos_th]             # 防 M1'→M2 success 断崖 (default 0)
++ w_success      · 1[full_success]                 # per-step dwell bonus (default 2.0)
+
+full_success = (pos_err < pos_th) ∧ (axis_err < axis_th)
+gate         = clamp((axis_gate_radius - pos_err) / (axis_gate_radius - pos_th), 0, 1)
+               # axis_gate_radius=inf 时 gate ≡ 1 (不门控, M1' 旧行为)
 ```
 
 - `rew_axis = 0` 时 axis 项消失 (M1'); `success_axis_threshold = inf` 时 success
   退化为 pos-only.
+- **axis-gate 与 pos_success bonus** 是修 M1'→M2 reward 断崖的关键: M1' pos-only
+  训练学到 "进 pos_th → +bonus" 的策略; M2 加 axis 后, 若不开 `rew_pos_success`
+  原来的成功状态 (pos 进, axis 还没对) 突然失去 bonus, policy 会先崩再学; 若
+  不开 `axis_gate_radius`, 远处 (pos_err 1m+) 也在被 axis 项干扰, 把 M1' reaching
+  skill 拉坏. M2 推荐 `--rew_pos_success 1.0 --axis_gate_radius 0.40`.
 - success 本身**不**做 absorbing — 只给每步 dwell bonus, 避免边界 hugging 的
   Q-target 断崖. 要切 hold-N absorbing, 给 `--terminal_hold_bonus > 0`.
 
@@ -150,14 +159,14 @@ python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --rew_home 0.0005
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
-# Step 2 / M2: pos + axis 一步到 ±37° 锥 (axis_th=0.2)
-# 如果前 50 epoch hold_success_rate 一直是 0 / axis_err_mean 没下降, 临时
-# warmup --success_axis_threshold 0.5 跑短一些, 但不作为正式 stage.
+# Step 2 / M2: pos + axis. 用 axis-gate + pos_success bonus 修 M1'→M2 断崖,
+# 直接到 ±37° 锥 (axis_th=0.2) 不需要再分 warmup 子阶段.
 python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --load_agent results/best_agent_M1p_32dim_pos10cm.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
-    --rew_axis 1.0 --success_axis_threshold 0.2
+    --rew_axis 1.0 --success_axis_threshold 0.2 \
+    --rew_pos_success 1.0 --axis_gate_radius 0.40
 cp results/best_agent.msh results/best_agent_M2_axis02.msh
 
 # 评估 (CLI 必须与训练一致, 否则 success 触发条件不同, 数字不可比)
@@ -165,7 +174,8 @@ python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \
     --agent_path results/best_agent_M2_axis02.msh \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
-    --rew_axis 1.0 --success_axis_threshold 0.2
+    --rew_axis 1.0 --success_axis_threshold 0.2 \
+    --rew_pos_success 1.0 --axis_gate_radius 0.40
 ```
 
 `--load_agent` 默认会清空 replay buffer (旧 reward 标签不能带过来), 加 `--keep_replay`
@@ -183,7 +193,8 @@ python scripts/visualize_targets.py --n_resets 30   # 看 reset 分布
 python scripts/visualize_policy.py \
     --preinsert_success_pos_threshold 0.10 \
     --rew_home 0.0005 \
-    --rew_axis 1.0 --success_axis_threshold 0.2
+    --rew_axis 1.0 --success_axis_threshold 0.2 \
+    --rew_pos_success 1.0 --axis_gate_radius 0.40
 ```
 
 ### 资产校验 (改 USD 时跑)
@@ -204,6 +215,8 @@ python scripts/archive/check_peghole_asset.py \
 | `--preinsert_success_pos_threshold` | env=0.10 | success 的 pos_err 阈值 (m) |
 | `--preinsert_offset` | env=0.05 | hole_entry 沿 hole_axis 的 preinsert 距离 (m) |
 | `--rew_axis` | env=0.0 | axis_err 权重. M1' 用 0, M2 用 1.0 |
+| `--rew_pos_success` | env=0.0 | pos-only success bonus. 防 M1'→M2 断崖, M2 推荐 1.0 |
+| `--axis_gate_radius` | env=inf | axis 项的距离门控半径 (m). M2 推荐 0.40 |
 | `--rew_home` | env=0.0 | home regularizer 权重. 0 = 关闭; 起步 0.0005 当极弱 tie-breaker |
 | `--success_axis_threshold` | env=inf | axis_err 的 success 阈值. M1' inf, M2 0.2 |
 | `--terminal_hold_bonus` | env=0.0 | hold-N 软 absorbing bonus, =0 关闭机制 |

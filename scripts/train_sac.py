@@ -88,7 +88,15 @@ def parse_args():
                    help="home regularizer 权重 (joint-range 归一化的 ||q - q_home||²). "
                         "默认 0 关闭. 当前 M1'/M2 建议 0.0005 当极弱 tie-breaker.")
     p.add_argument("--rew_success", type=float, default=None,
-                   help="覆盖 env 的 per-step success bonus (默认 2.0)")
+                   help="覆盖 env 的 per-step full_success (pos∧axis) bonus (默认 2.0)")
+    p.add_argument("--rew_pos_success", type=float, default=None,
+                   help="pos-only success bonus (env 默认 0.0). M2 推荐 1.0 ~ 2.0: "
+                        "维持 M1' 已学的'进 pos 阈值给 bonus'信号, 避免 M2 把 axis 加上后"
+                        "M1' 成功状态突然失去 bonus 造成 reward 断崖.")
+    p.add_argument("--axis_gate_radius", type=float, default=None,
+                   help="axis 惩罚的距离门控半径 (m). env 默认 inf = 不门控. "
+                        "M2 推荐 0.40: pos_err >= 0.40m 时 axis 项=0, 在 "
+                        "[pos_th, 0.40m] 区间线性 ramp, 进 pos_th 后 gate 满.")
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重 (默认 0.0 = M1' pos-only). "
                         "M2 设 1.0 启用轴对齐惩罚.")
@@ -158,8 +166,9 @@ def main():
     from envs import DualArmPegHoleEnv
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_action", "rew_success", "rew_axis",
-                "rew_home", "success_axis_threshold", "terminal_hold_bonus",
+                "preinsert_offset", "rew_action", "rew_success", "rew_pos_success",
+                "rew_axis", "rew_home", "axis_gate_radius",
+                "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:

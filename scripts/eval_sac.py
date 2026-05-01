@@ -54,6 +54,10 @@ def parse_args():
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重. **eval 不算 reward 主项, 但 visualize 会读**, "
                         "保留 CLI 一致性. 默认 0 = M1' 行为.")
+    p.add_argument("--rew_pos_success", type=float, default=None,
+                   help="覆盖 env 的 pos-only success bonus. 应与 train 一致.")
+    p.add_argument("--axis_gate_radius", type=float, default=None,
+                   help="覆盖 env 的 axis 距离门控半径. 应与 train 一致.")
     p.add_argument("--rew_home", type=float, default=None,
                    help="覆盖 env 的 home regularizer 权重. 评估 J/R 时应与 train 一致.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
@@ -86,8 +90,9 @@ def main():
 
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_axis", "rew_home", "success_axis_threshold",
-                "terminal_hold_bonus",
+                "preinsert_offset", "rew_axis", "rew_pos_success",
+                "rew_home", "axis_gate_radius",
+                "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:

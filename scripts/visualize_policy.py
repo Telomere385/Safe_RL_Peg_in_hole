@@ -78,6 +78,10 @@ def parse_args():
                    help="冻结多少秒, Ctrl-C 可提前退出")
     p.add_argument("--stochastic", action="store_true",
                    help="用 SAC 采样策略而不是 deterministic tanh(mu)")
+    p.add_argument("--rew_pos_success", type=float, default=None,
+                   help="覆盖 env 的 pos-only success bonus. 应与 train 一致.")
+    p.add_argument("--axis_gate_radius", type=float, default=None,
+                   help="覆盖 env 的 axis 距离门控半径. 应与 train 一致.")
     p.add_argument("--clearance_hard", type=float, default=None,
                    help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值. 应与 train 一致, "
                         "否则可能出现 train 不撞 / viz 老 reset 的错觉. 关闭写 --clearance_hard=-inf.")
@@ -113,7 +117,8 @@ def main():
         env_kwargs["rew_home"] = args.rew_home
     if args.success_axis_threshold is not None:
         env_kwargs["success_axis_threshold"] = args.success_axis_threshold
-    for key in ("clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
+    for key in ("rew_pos_success", "axis_gate_radius",
+                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
