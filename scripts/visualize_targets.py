@@ -20,6 +20,7 @@
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -231,6 +232,7 @@ def main():
     batch_radial_err = []
     batch_axial_dist = []
     batch_success = []
+    batch_min_clearance = []
     for r in range(args.n_resets):
         obs, _ = mdp.reset_all(mask)
         # M0+ 解析式 frame 不再依赖 XFormPrim; 但 reset_all 后 BODY_POS / BODY_ROT
@@ -238,17 +240,22 @@ def main():
         mdp._world.step(render=False)
         frames = mdp.get_preinsert_frames()
         errors = mdp._compute_preinsert_errors(frames)
+        # sphere-proxy clearance 在 reset 直后的样本: 用来判断 home pose +
+        # initial_joint_noise 是否会让双臂在 reset 那一步就 trip clearance_hard.
+        min_clearance, _ = mdp._compute_min_clearance()
         batch_pos_err.append(errors["pos_err"].detach())
         batch_axis_err.append(errors["axis_err"].detach())
         batch_radial_err.append(errors["radial_err"].detach())
         batch_axial_dist.append(errors["axial_dist"].detach())
         batch_success.append(errors["success_mask"].detach())
+        batch_min_clearance.append(min_clearance.detach())
 
     pos = torch.cat(batch_pos_err)
     ax = torch.cat(batch_axis_err)
     rad = torch.cat(batch_radial_err)
     axd = torch.cat(batch_axial_dist)
     suc = torch.cat(batch_success)
+    clr = torch.cat(batch_min_clearance)
     n_total = pos.numel()
     # success_rate 名字 + 阈值显式标出: axis_th=inf 时是 pos-only success, 不是
     # M2 的 pos∧axis success — 不标清楚容易误读成 M2 的乐观估计.
@@ -261,13 +268,25 @@ def main():
         f"axis<{mdp._success_axis_threshold:.3f})"
     )
     for name, t in [("pos_err", pos), ("axis_err", ax),
-                    ("radial_err", rad), ("axial_dist", axd)]:
+                    ("radial_err", rad), ("axial_dist", axd),
+                    ("min_clearance", clr)]:
         print(
-            f"  {name:11s} mean={float(t.mean()):+.4f}  "
+            f"  {name:13s} mean={float(t.mean()):+.4f}  "
             f"min={float(t.min()):+.4f}  max={float(t.max()):+.4f}  "
             f"std={float(t.std(unbiased=False)):+.4f}"
         )
     print(f"  {success_label} = {float(suc.float().mean()):.4f}")
+    # 关键诊断: clearance_hard (env 默认 0.0) 与 reset 分布的 min 余量对比.
+    # min_clearance.min < clearance_hard 的样本就是会在 reset 那一步就被 sphere
+    # proxy 直接 trip 掉的 env. >0 比例越高越好.
+    ch = mdp._clearance_hard
+    if math.isfinite(ch):
+        trip_rate = float((clr < ch).float().mean())
+        print(
+            f"  clearance vs clearance_hard={ch:+.4f}: "
+            f"trip_rate={trip_rate:.4f} "
+            f"({'⚠ reset 即 trip, 训练起不来' if trip_rate > 0.0 else 'OK'})"
+        )
 
     mdp._world.step(render=True)
     handles = _spawn_preinsert_markers()

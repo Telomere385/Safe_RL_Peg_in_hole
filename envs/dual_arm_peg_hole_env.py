@@ -75,6 +75,18 @@ LEFT_ARM_JOINTS = [f"left_arm_A{i}" for i in CONTROLLED_IDX]
 RIGHT_ARM_JOINTS = [f"right_arm_A{i}" for i in CONTROLLED_IDX]
 ARM_JOINTS = LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS  # 14
 
+# Home pose — 取代 USD 自带的 zero 默认位姿. 双臂在胸前略弯肘的 ready 姿态,
+# 让 reset center 落在任务相关区域, 减少 M1' 早期探索的无效扇区.
+# 镜像约定: 奇数 joint (绕"竖向"轴) 取反, 偶数 joint (hinge) 同号. 镜像若不对
+# (右臂方向反了 / 甩出去), 调换 A1 正负号通常即可.
+HOME_JOINT_POS = (
+    # left arm  A1     A2      A3      A4     A5   A6   A7
+    -2.568,  -0.250, -0.078,  0.814,  0.0, 0.0,  0.010,
+    # right arm A1     A2      A3      A4     A5   A6   A7
+    +2.568,  -0.250, +0.078,  0.814,  0.0, 0.0, -0.010,
+)
+assert len(HOME_JOINT_POS) == 14, "HOME_JOINT_POS 必须 14 维 (左 7 + 右 7)"
+
 LEFT_ARM_LINKS = [f"/left_arm_link_{i}" for i in range(1, 8)]
 RIGHT_ARM_LINKS = [f"/right_arm_link_{i}" for i in range(1, 8)]
 
@@ -279,9 +291,25 @@ class DualArmPegHoleEnv(IsaacSim):
         # 关节位限 + 默认位
         limits = self._task.get_joint_pos_limits()
         self._joint_lower, self._joint_upper = limits[0], limits[1]
-        self._default_joint_pos = self._task.robots.get_joints_default_state().positions[0][
-            self._task._controlled_joints
-        ].clone()
+        # 不用 USD 自带的 zero pose, 改用 HOME_JOINT_POS (胸前 ready), 避免 reset
+        # center 落在 zero 全展开姿态, M1' 早期探索浪费在无效扇区.
+        self._default_joint_pos = torch.tensor(
+            HOME_JOINT_POS, device=device, dtype=self._joint_lower.dtype
+        )
+        # fail-fast: home pose 必须落在每个关节的 [lower, upper] 内, 不然 reset
+        # 那一步 PhysX 会把它 clamp 到边界, 与设计意图不符.
+        if torch.any(self._default_joint_pos < self._joint_lower) or torch.any(
+            self._default_joint_pos > self._joint_upper
+        ):
+            bad = (
+                (self._default_joint_pos < self._joint_lower)
+                | (self._default_joint_pos > self._joint_upper)
+            ).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(
+                f"HOME_JOINT_POS 越界: 关节索引 {bad} 不在 [lower, upper] 内. "
+                f"lower={self._joint_lower.tolist()}  upper={self._joint_upper.tolist()}  "
+                f"home={self._default_joint_pos.tolist()}"
+            )
 
         # USD iiwa 默认 position-drive (kp ~ 5e5); velocity 控制必须把 kp 置 0,
         # 否则 reset 里 set_joint_positions 会一并写 pos_target, 高 kp 把关节钉
