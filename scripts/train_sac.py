@@ -108,6 +108,13 @@ def parse_args():
     p.add_argument("--hold_success_steps", type=int, default=10,
                    help="eval success 定义 + env 终止阈值: 连续 N 步都在阈值内. "
                         "N=10 ≈ 1s hold (per-step dt≈0.1s).")
+    p.add_argument("--clearance_hard", type=float, default=None,
+                   help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值 (m). 默认 0.0 = 球壳一接触即"
+                        "触发 hard absorbing. 传 -inf 关闭, 只信 PhysX 力检测.")
+    p.add_argument("--proxy_arm_radius", type=float, default=None,
+                   help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
+    p.add_argument("--proxy_ee_radius", type=float, default=None,
+                   help="覆盖 env 的 EE sphere proxy 半径 (默认 0.03m).")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -151,7 +158,8 @@ def main():
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_action", "rew_success", "rew_axis",
-                "success_axis_threshold", "terminal_hold_bonus"):
+                "success_axis_threshold", "terminal_hold_bonus",
+                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value

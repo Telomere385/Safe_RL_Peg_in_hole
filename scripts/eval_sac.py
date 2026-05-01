@@ -58,6 +58,13 @@ def parse_args():
                         "**train 时若启用了它, eval 也必须传同样的值**.")
     p.add_argument("--hold_success_steps", type=int, default=10,
                    help="验证 success 定义: episode 内至少出现连续 N 步都在阈值内.")
+    p.add_argument("--clearance_hard", type=float, default=None,
+                   help="覆盖 env 的 sphere-proxy 自碰撞兜底阈值. 应与 train 时一致, "
+                        "否则碰撞触发率不同, success / J 数字不可比.")
+    p.add_argument("--proxy_arm_radius", type=float, default=None,
+                   help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
+    p.add_argument("--proxy_ee_radius", type=float, default=None,
+                   help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--stochastic", action="store_true",
                    help="使用 SAC 采样策略评估. 默认使用 deterministic tanh(mu)")
     return p.parse_args()
@@ -74,7 +81,8 @@ def main():
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_axis", "success_axis_threshold",
-                "terminal_hold_bonus"):
+                "terminal_hold_bonus",
+                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
