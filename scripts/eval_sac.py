@@ -11,12 +11,13 @@ success / hold-N 触发条件不同, 数字没有可比性.
         --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
         --rew_home 0.0005
 
-    # M2 (pos + axis)
+    # M2 (pos + axis, axis-gate + pos_success bonus)
     python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \\
         --agent_path results/best_agent_M2_axis02.msh \\
         --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
         --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2
+        --rew_axis 1.0 --success_axis_threshold 0.2 \\
+        --rew_pos_success 1.0 --axis_gate_radius 0.40
 """
 
 import argparse
@@ -124,8 +125,11 @@ def main():
         f"max_hold_mean={m['max_hold_mean']:.1f}  "
         f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
         f"final_in_thresh_rate={m['final_in_thresh_rate']:.3f}  "
+        f"pos_success_rate={m['pos_success_rate']:.3f}  "
         f"pos_err_mean={m['pos_err_mean']:.4f}m  "
-        f"axis_err_mean={m['axis_err_mean']:.4f}"
+        f"axis_err_mean={m['axis_err_mean']:.4f}  "
+        f"axis_gate_mean={m['axis_gate_mean']:.3f}  "
+        f"gated_axis_pen={m['gated_axis_penalty_mean']:.3f}"
     )
 
     mdp.stop()

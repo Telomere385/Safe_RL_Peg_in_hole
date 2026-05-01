@@ -4,9 +4,11 @@
 - compute_hold_metrics: 从 evaluate() 返回的 flatten 后的 dataset 算 hold-N
   success 与每步 in-threshold / pos_err / axis_err 统计.
   in_thresh = (pos_err < pos_th) ∧ (axis_err < axis_th); axis_th=inf 退化为
-  pos-only (M1' 行为).
+  pos-only (M1' 行为). 同时单独报 pos_success_rate (只看 pos<pos_th, 反映
+  M1' 已学技能保住没) 与 axis_gate_mean (axis 项实际被门控到几成).
 """
 
+import math
 from contextlib import contextmanager
 
 import numpy as np
@@ -42,6 +44,14 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
     """
     _, _, _, next_state, _, last = dataset.parse(to="torch")
     pos_err, axis_err, in_thresh = mdp._compute_task_errors(next_state)
+    pos_th = mdp._preinsert_success_pos_threshold
+    pos_in_thresh = pos_err < pos_th
+    # axis-gate 跟 reward 同公式; gate_radius=inf 时全 1.
+    if math.isfinite(mdp._axis_gate_radius):
+        denom = max(mdp._axis_gate_radius - pos_th, 1e-6)
+        axis_gate = ((mdp._axis_gate_radius - pos_err) / denom).clamp(0.0, 1.0)
+    else:
+        axis_gate = torch.ones_like(pos_err)
 
     last_np = last.cpu().numpy().astype(bool)
     in_thresh_np = in_thresh.cpu().numpy().astype(bool)
@@ -69,6 +79,12 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
         "final_in_thresh_rate": float(np.mean(ep_final_in_thresh)) if ep_final_in_thresh else 0.0,
         "pos_err_mean": float(pos_err.mean()),
         "axis_err_mean": float(axis_err.mean()),
+        # M1' pos 技能保住程度 — 不被 full success (pos∧axis) 掩盖.
+        "pos_success_rate": float(pos_in_thresh.float().mean()),
+        # axis 项实际被门控的程度. ≈0 = 还远, axis 不施压; ≈1 = 进 pos 阈, axis 满压.
+        "axis_gate_mean": float(axis_gate.mean()),
+        # 真正进 reward 的 axis 惩罚量级 (gate * axis_err), 反映 axis 信号强度.
+        "gated_axis_penalty_mean": float((axis_gate * axis_err).mean()),
     }
 
 

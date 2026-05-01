@@ -247,6 +247,9 @@ def main():
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
                 f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
+                f"w_pos_success={mdp._w_pos_success:.3f}  "
+                f"w_success={mdp._w_success:.3f}  "
+                f"axis_gate_radius={mdp._axis_gate_radius:.3f}m  "
                 f"w_home={mdp._w_home:.4f}  "
                 f"preinsert_offset={mdp._preinsert_offset:.3f}m")
     if args.load_agent is not None:
@@ -362,8 +365,11 @@ def main():
                     f"max_hold_mean={m['max_hold_mean']:.1f}  "
                     f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
                     f"final_in_thresh_rate={m['final_in_thresh_rate']:.3f}  "
+                    f"pos_success_rate={m['pos_success_rate']:.3f}  "
                     f"pos_err_mean={m['pos_err_mean']:.4f}m  "
-                    f"axis_err_mean={m['axis_err_mean']:.4f}")
+                    f"axis_err_mean={m['axis_err_mean']:.4f}  "
+                    f"axis_gate_mean={m['axis_gate_mean']:.3f}  "
+                    f"gated_axis_pen={m['gated_axis_penalty_mean']:.3f}")
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
@@ -373,8 +379,11 @@ def main():
                 "eval_max_hold_mean": m["max_hold_mean"],
                 "eval_in_thresh_rate": m["in_thresh_rate"],
                 "eval_final_in_thresh_rate": m["final_in_thresh_rate"],
+                "eval_pos_success_rate": m["pos_success_rate"],
                 "eval_pos_err_mean": m["pos_err_mean"],
                 "eval_axis_err_mean": m["axis_err_mean"],
+                "eval_axis_gate_mean": m["axis_gate_mean"],
+                "eval_gated_axis_penalty_mean": m["gated_axis_penalty_mean"],
                 "alpha": agent._alpha.item(),
                 "absorb_per_epoch": absorb_epoch,
                 "absorb_physx_per_epoch": absorb_physx_epoch,

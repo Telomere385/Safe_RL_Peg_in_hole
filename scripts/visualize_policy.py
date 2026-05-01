@@ -18,12 +18,13 @@ stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mas
         --preinsert_success_pos_threshold 0.10 \\
         --rew_home 0.0005
 
-    # M2 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.2)
+    # M2 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.2 + axis-gate)
     python scripts/visualize_policy.py \\
         --agent_path results/best_agent_M2_axis02.msh \\
         --preinsert_success_pos_threshold 0.10 \\
         --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2
+        --rew_axis 1.0 --success_axis_threshold 0.2 \\
+        --rew_pos_success 1.0 --axis_gate_radius 0.40
 
     python scripts/visualize_policy.py --freeze_seconds 30
     python scripts/visualize_policy.py --viz_env_idx 1

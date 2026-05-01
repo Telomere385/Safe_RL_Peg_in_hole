@@ -133,7 +133,7 @@ gate         = clamp((axis_gate_radius - pos_err) / (axis_gate_radius - pos_th),
 
 - **自碰撞 — 双信号 OR**, 任一触发即吸收, reward 盖成 `r_min/(1-γ) ≈ -200`:
   - PhysX 接触力: `arm_L vs arm_R > collision_force_threshold` (default 10 N)
-  - **Sphere-proxy clearance**: 双臂各 19 球 (8 关节球 + 7 中点球 + 4 EE 球),
+  - **Sphere-proxy clearance**: 双臂各 17 球 (8 关节球 + 7 中点球 + 2 EE 球: coupler + hande_link, finger 不放球),
     球心两两算 `clearance = ||c_L - c_R|| - r_L - r_R`, 取 min.
     `min_clearance < clearance_hard` 即触发 (default `clearance_hard = 0.0`,
     球壳一接触就算碰撞). PhysX 力检测在 1cm-5cm 边缘失明, sphere proxy 是几何兜底.
