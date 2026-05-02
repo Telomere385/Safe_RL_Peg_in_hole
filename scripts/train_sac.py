@@ -67,15 +67,19 @@ def parse_args():
                    help="两次 fit 之间收集的总 env-step 数 (默认 = num_envs, 即 1 个 vector-step)")
     p.add_argument("--utd", type=int, default=None,
                    help="每次 fit 块对应的总梯度步数. 默认自动取 n_steps_per_fit, 使 true UTD≈1")
-    p.add_argument("--lr_actor", type=float, default=3e-4)
+    p.add_argument("--lr_actor", type=float, default=1e-4,
+                   help="降到 1e-4 (从 3e-4): cold-start 联合任务下 actor 更新太快"
+                        "会在早期被噪声 critic 拉坏 (从 38D run 数据观察).")
     p.add_argument("--lr_critic", type=float, default=3e-4)
     p.add_argument("--lr_alpha", type=float, default=3e-4)
-    p.add_argument("--alpha_max", type=float, default=0.1,
-                   help="alpha 上限, 抑制高维动作下 entropy 奖励压过任务 reward. "
-                        "0.2 在 M1' 测过会 collapse (alpha 顶到 cap 时探索压过利用), "
-                        "0.1 更稳.")
-    p.add_argument("--target_entropy", type=float, default=None,
-                   help="目标 entropy. 默认自动取 -act_dim (SAC 标准设置)")
+    p.add_argument("--alpha_max", type=float, default=0.2,
+                   help="alpha 上限. 默认 0.2 — cold-start 联合任务需要充分探索, "
+                        "0.05/0.1 在以前实验里把 policy 锁死在 plateau. 配合 "
+                        "--target_entropy=-7 使用让 SAC 不会一直顶到 cap.")
+    p.add_argument("--target_entropy", type=float, default=-7.0,
+                   help="目标 entropy 默认 -7 (= -act_dim/2, 不再用 -14). "
+                        "-act_dim 在 14-DoF 上让 SAC 维持极高随机性, alpha 永远顶 cap, "
+                        "policy 学不到集中策略. -7 让 SAC 倾向略集中, alpha 能稳态.")
     p.add_argument("--n_eval_episodes", type=int, default=None,
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
     p.add_argument("--initial_joint_noise", type=float, default=None,
@@ -135,10 +139,14 @@ def parse_args():
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.03m).")
     p.add_argument("--use_axis_obs", action="store_true",
                    help="agent obs 32 → 38 维: 末尾追加 peg_axis[3] + hole_axis[3] "
-                        "(world frame unit vectors). axis_dot 标量缺方向信息, "
-                        "policy 在 14-DoF 动作空间难学 axis 对齐 — 加显式向量解锁这一步. "
-                        "**注意**: obs 维度变了, 32 维 M1' checkpoint 不能 warm-start, "
-                        "必须冷启动重训 M1' (38 维) 后再做 M2.")
+                        "(world frame unit vectors). 历史诊断, 已被 --use_rotvec_obs 取代.")
+    p.add_argument("--use_rotvec_obs", action="store_true",
+                   help="agent obs 32 → 34 维: axis_dot[1] 替换成 rotvec_error[3] "
+                        "(peg 旋到对齐 hole 的最小旋转向量, world frame). 模长=角度 ∈ [0,π], "
+                        "方向=该绕的世界轴 — 直接告诉 policy 控制方向, 不用自己学 SO(3) 几何. "
+                        "**注意**: 与 use_axis_obs 互斥; obs 维度变, 32/38 维 checkpoint 不能"
+                        "warm-start; success_axis_threshold 语义变成 *弧度* (旧 0.2 是 1+dot, "
+                        "新 0.2 ≈ 11°, 想要旧的 ±37° 锥用 0.65 rad).")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -191,6 +199,8 @@ def main():
     # bool flags: 直接读 args, 不能用 None 哨兵 (action="store_true" 默认 False)
     if args.use_axis_obs:
         env_kwargs["use_axis_obs"] = True
+    if args.use_rotvec_obs:
+        env_kwargs["use_rotvec_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -278,7 +288,13 @@ def main():
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
     logger.info(f"清理旧 best checkpoint (本次 run 自建): {best_path}")
-    logger.info(f"obs_dim={obs_dim} ({'+axis_vec' if mdp._use_axis_obs else 'base'})  "
+    if mdp._use_rotvec_obs:
+        obs_mode = "rotvec"
+    elif mdp._use_axis_obs:
+        obs_mode = "+axis_vec"
+    else:
+        obs_mode = "base"
+    logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "

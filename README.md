@@ -159,6 +159,19 @@ python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --rew_home 0.0005
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
+# 单 stage cold-start (rotvec obs, axis-gate 关, 推荐 M2 主线):
+# - 34 维 obs (rotvec_error 替换 axis_dot): 直接给 SO(3) 误差控制方向信号
+# - axis_gate_radius=inf: axis 项始终有信号, 远处也能学转 wrist
+# - lr_actor=1e-4, alpha_max=0.2, target_entropy=-7 (default): 不再让 SAC 锁死
+# - success_axis_threshold 用弧度 (rotvec 模长), 0.65 ≈ 旧 ±37° 锥
+python scripts/train_sac.py --no_wandb --n_epochs 500 \
+    --use_rotvec_obs \
+    --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
+    --rew_home 0.0005 \
+    --rew_axis 0.3 --success_axis_threshold 0.65 \
+    --rew_pos_success 1.0
+# 不需要 --axis_gate_radius (默认 inf), 不需要 --load_agent (cold start).
+
 # Step 2 / M2: pos + axis. 用 axis-gate + pos_success bonus 修 M1'→M2 断崖.
 # **--actor_only_warmstart 必加**: stage 切换 reward shape 变了, 旧 critic 的 Q
 # 语义已经过时, 会拽坏 actor; 只继承 M1' actor 权重, critic/alpha 冷启更稳.
@@ -243,7 +256,8 @@ python scripts/archive/check_peghole_asset.py \
 | `--load_agent` | None | warm-start checkpoint 路径 |
 | `--actor_only_warmstart` | False | 仅继承 actor 权重, critic/alpha/replay 全冷启动. M2 必加 |
 | `--keep_replay` | False | warm-start 时保留旧 replay buffer (默认清空) |
-| `--use_axis_obs` | False | 32→38 维 obs (加 peg_axis + hole_axis). 改 obs 必须冷启动重训 M1' |
+| `--use_axis_obs` | False | 32→38 维 obs (加 peg_axis + hole_axis). 历史诊断 |
+| `--use_rotvec_obs` | False | 32→34 维 obs (rotvec_error 替换 axis_dot). M2 推荐, 互斥于 use_axis_obs |
 | `--n_eval_episodes` | num_envs | 每 epoch 末 eval 的 episode 数, 必须能被 num_envs 整除 |
 | `--render` | False | 打开 IsaacSim 窗口 (无此 flag 即 headless) |
 | `--seed` | 42 | torch + numpy seed |

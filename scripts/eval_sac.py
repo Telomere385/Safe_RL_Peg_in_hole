@@ -79,6 +79,8 @@ def parse_args():
     p.add_argument("--use_axis_obs", action="store_true",
                    help="38 维 obs (peg_axis + hole_axis 进 obs). **必须与 train 一致**, "
                         "否则 actor 输入维度对不上加载会失败.")
+    p.add_argument("--use_rotvec_obs", action="store_true",
+                   help="34 维 obs (rotvec_error 替换 axis_dot). **必须与 train 一致**.")
     p.add_argument("--stochastic", action="store_true",
                    help="使用 SAC 采样策略评估. 默认使用 deterministic tanh(mu)")
     return p.parse_args()
@@ -103,6 +105,8 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_obs:
         env_kwargs["use_axis_obs"] = True
+    if args.use_rotvec_obs:
+        env_kwargs["use_rotvec_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     print(f"[EVAL ENV] {env_kwargs}")
 

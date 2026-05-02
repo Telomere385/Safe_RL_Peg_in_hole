@@ -92,6 +92,8 @@ def parse_args():
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--use_axis_obs", action="store_true",
                    help="38 维 obs (peg_axis + hole_axis 进 obs). 应与 train 一致.")
+    p.add_argument("--use_rotvec_obs", action="store_true",
+                   help="34 维 obs (rotvec_error 替换 axis_dot). 应与 train 一致.")
     return p.parse_args()
 
 
@@ -127,6 +129,8 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_obs:
         env_kwargs["use_axis_obs"] = True
+    if args.use_rotvec_obs:
+        env_kwargs["use_rotvec_obs"] = True
     mdp = DualArmPegHoleEnv(**env_kwargs)
     print(f"[VIZ STAGE] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
           f"axis_th={mdp._success_axis_threshold:.3f}  "
