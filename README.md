@@ -243,6 +243,7 @@ python scripts/archive/check_peghole_asset.py \
 | `--load_agent` | None | warm-start checkpoint 路径 |
 | `--actor_only_warmstart` | False | 仅继承 actor 权重, critic/alpha/replay 全冷启动. M2 必加 |
 | `--keep_replay` | False | warm-start 时保留旧 replay buffer (默认清空) |
+| `--use_axis_obs` | False | 32→38 维 obs (加 peg_axis + hole_axis). 改 obs 必须冷启动重训 M1' |
 | `--n_eval_episodes` | num_envs | 每 epoch 末 eval 的 episode 数, 必须能被 num_envs 整除 |
 | `--render` | False | 打开 IsaacSim 窗口 (无此 flag 即 headless) |
 | `--seed` | 42 | torch + numpy seed |

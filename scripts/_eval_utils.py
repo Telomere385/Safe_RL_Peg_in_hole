@@ -72,6 +72,20 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
         start = end + 1
 
     hold_flags = np.asarray([mh >= hold_n_steps for mh in ep_max_holds], dtype=bool)
+    # 条件指标: 只在 pos_in_thresh 的 timesteps 上算 axis 相关统计.
+    # 如果 axis_err_in_pos_thresh_mean 长期 1.0+ 而 pos_success_rate>0, 就坐实
+    # "进 pos_th 但 axis 学不会" — 这是 obs 信号不足 (axis_dot 标量缺方向信息)
+    # 而不是 reward 量级问题, reward 调参治不了, 必须加 axis 向量 obs.
+    pos_in_thresh_count = int(pos_in_thresh.sum().item())
+    if pos_in_thresh_count > 0:
+        axis_err_in_pos_thresh_mean = float(axis_err[pos_in_thresh].mean())
+        axis_err_in_pos_thresh_min = float(axis_err[pos_in_thresh].min())
+        axis_gate_in_pos_thresh_mean = float(axis_gate[pos_in_thresh].mean())
+    else:
+        axis_err_in_pos_thresh_mean = float("nan")
+        axis_err_in_pos_thresh_min = float("nan")
+        axis_gate_in_pos_thresh_mean = float("nan")
+
     return {
         "hold_success_rate": float(hold_flags.mean()) if len(hold_flags) else 0.0,
         "max_hold_mean": float(np.mean(ep_max_holds)) if ep_max_holds else 0.0,
@@ -85,6 +99,11 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
         "axis_gate_mean": float(axis_gate.mean()),
         # 真正进 reward 的 axis 惩罚量级 (gate * axis_err), 反映 axis 信号强度.
         "gated_axis_penalty_mean": float((axis_gate * axis_err).mean()),
+        # 条件指标 — 只看 pos_in_thresh 帧:
+        "pos_in_thresh_count": pos_in_thresh_count,
+        "axis_err_in_pos_thresh_mean": axis_err_in_pos_thresh_mean,
+        "axis_err_in_pos_thresh_min": axis_err_in_pos_thresh_min,
+        "axis_gate_in_pos_thresh_mean": axis_gate_in_pos_thresh_mean,
     }
 
 

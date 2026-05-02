@@ -76,6 +76,9 @@ def parse_args():
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
+    p.add_argument("--use_axis_obs", action="store_true",
+                   help="38 维 obs (peg_axis + hole_axis 进 obs). **必须与 train 一致**, "
+                        "否则 actor 输入维度对不上加载会失败.")
     p.add_argument("--stochastic", action="store_true",
                    help="使用 SAC 采样策略评估. 默认使用 deterministic tanh(mu)")
     return p.parse_args()
@@ -98,6 +101,8 @@ def main():
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
+    if args.use_axis_obs:
+        env_kwargs["use_axis_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     print(f"[EVAL ENV] {env_kwargs}")
 
@@ -131,6 +136,15 @@ def main():
         f"axis_gate_mean={m['axis_gate_mean']:.3f}  "
         f"gated_axis_pen={m['gated_axis_penalty_mean']:.3f}"
     )
+    if m['pos_in_thresh_count'] > 0:
+        print(
+            f"  ↳ pos_in_thresh_count={m['pos_in_thresh_count']}  "
+            f"axis_err_in_pos_th_mean={m['axis_err_in_pos_thresh_mean']:.4f}  "
+            f"axis_err_in_pos_th_min={m['axis_err_in_pos_thresh_min']:.4f}  "
+            f"axis_gate_in_pos_th_mean={m['axis_gate_in_pos_thresh_mean']:.3f}"
+        )
+    else:
+        print(f"  ↳ pos_in_thresh_count=0  axis_err_in_pos_th=n/a")
 
     mdp.stop()
 

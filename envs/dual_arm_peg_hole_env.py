@@ -160,12 +160,16 @@ HOLE_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 
 # Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper
 # (obs_helper 的 idx_map 对应 raw obs 而非 agent obs).
-# 32 维布局对所有 stage (M1' / M2) 通用; M3+ 才会再加 radial/axial 维度.
+# 基础 32 维 (M1' / M2 默认), 开 --use_axis_obs 后追加 6 维 (peg_axis + hole_axis)
+# = 38 维, 给 policy 显式的轴方向信号 (axis_dot 标量缺方向, 14-DoF 难学 axis 对齐).
 _AGENT_OBS_JOINT_POS = slice(0, 14)
 _AGENT_OBS_JOINT_VEL = slice(14, 28)
 _AGENT_OBS_POS_VEC = slice(28, 31)
 _AGENT_OBS_AXIS_DOT = slice(31, 32)
-AGENT_OBS_DIM = 32
+_AGENT_OBS_PEG_AXIS = slice(32, 35)        # 仅 use_axis_obs=True 时有效
+_AGENT_OBS_HOLE_AXIS = slice(35, 38)       # 仅 use_axis_obs=True 时有效
+AGENT_OBS_DIM_BASE = 32
+AGENT_OBS_DIM_AXIS = 38
 
 DEFAULT_PREINSERT_OFFSET = 0.05
 
@@ -207,6 +211,11 @@ class DualArmPegHoleEnv(IsaacSim):
         clearance_hard=0.0,
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
+        # 38 维 obs: 基础 32 维 + peg_axis[3] + hole_axis[3]. axis_dot 标量保留
+        # (reward 还要用), 这里只是给 policy 显式方向信号 — 单标量 axis_dot 不告诉
+        # "该绕哪个轴转", 14-DoF SAC 在 32 维下学不出 axis 对齐 (经实验确认).
+        # 默认 False 向后兼容 (M1' 已训好的 32 维 actor 还能 warm-start).
+        use_axis_obs=False,
         usd_path=None,
     ):
         self._action_scale = action_scale
@@ -253,6 +262,8 @@ class DualArmPegHoleEnv(IsaacSim):
         self._clearance_hard = float(clearance_hard)
         self._proxy_arm_radius = float(proxy_arm_radius)
         self._proxy_ee_radius = float(proxy_ee_radius)
+        self._use_axis_obs = bool(use_axis_obs)
+        self._agent_obs_dim = AGENT_OBS_DIM_AXIS if self._use_axis_obs else AGENT_OBS_DIM_BASE
         if not (math.isfinite(self._proxy_arm_radius) and self._proxy_arm_radius > 0.0):
             raise ValueError(
                 f"proxy_arm_radius 必须是有限正数, 传入 {proxy_arm_radius}"
@@ -412,8 +423,16 @@ class DualArmPegHoleEnv(IsaacSim):
         pos_hi = torch.full((3,), 5.0, device=jp_low.device, dtype=dtype)
         axis_lo = torch.full((1,), -1.0, device=jp_low.device, dtype=dtype)
         axis_hi = torch.full((1,), 1.0, device=jp_low.device, dtype=dtype)
-        new_obs_low = torch.cat([jp_low, jv_low, pos_lo, axis_lo], dim=0)
-        new_obs_high = torch.cat([jp_high, jv_high, pos_hi, axis_hi], dim=0)
+        chunks_low = [jp_low, jv_low, pos_lo, axis_lo]
+        chunks_high = [jp_high, jv_high, pos_hi, axis_hi]
+        if self._use_axis_obs:
+            # peg_axis / hole_axis 都是 unit vector ∈ [-1, +1]^3.
+            vec_lo = torch.full((3,), -1.0, device=jp_low.device, dtype=dtype)
+            vec_hi = torch.full((3,), +1.0, device=jp_low.device, dtype=dtype)
+            chunks_low.extend([vec_lo, vec_lo])
+            chunks_high.extend([vec_hi, vec_hi])
+        new_obs_low = torch.cat(chunks_low, dim=0)
+        new_obs_high = torch.cat(chunks_high, dim=0)
         mdp_info.observation_space = Box(new_obs_low, new_obs_high, data_type=dtype)
         return mdp_info
 
@@ -424,13 +443,14 @@ class DualArmPegHoleEnv(IsaacSim):
         return clipped * self._action_scale
 
     def _create_observation(self, obs):
-        """raw obs (42 dim) → agent obs (32 dim).
+        """raw obs (42 dim) → agent obs (32 或 38 dim, 取决于 use_axis_obs).
 
         raw 布局 (与 observation_spec 顺序一致):
             joint_pos[14] joint_vel[14] left_ee_pos[3] right_ee_pos[3]
             left_ee_rot[4] right_ee_rot[4]
         agent obs 布局 (见 _AGENT_OBS_* 切片):
-            joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]                  ← 32D
+            (+ peg_axis[3] + hole_axis[3] 当 use_axis_obs=True)                 ← 38D
         """
         joint_pos = self.observation_helper.get_from_obs(obs, "joint_pos")
         joint_vel = self.observation_helper.get_from_obs(obs, "joint_vel")
@@ -458,6 +478,11 @@ class DualArmPegHoleEnv(IsaacSim):
         self._cached_pos_vec = pos_vec
         self._cached_axis_err = axis_err
 
+        if self._use_axis_obs:
+            return torch.cat(
+                [joint_pos, joint_vel, pos_vec, axis_dot, peg_axis, hole_axis],
+                dim=-1,
+            )
         return torch.cat([joint_pos, joint_vel, pos_vec, axis_dot], dim=-1)
 
     def _compute_task_errors(self, agent_obs):
@@ -606,13 +631,14 @@ class DualArmPegHoleEnv(IsaacSim):
         self._world.step(render=False)
 
     def get_obs_scale(self):
-        """32 维 fixed-divisor 归一化向量, 与 agent obs 一一对应.
+        """32 / 38 维 fixed-divisor 归一化向量, 与 agent obs 一一对应.
 
         缩放选择 (大致让每维标准差落到 ~1):
             joint_pos: 半关节范围
             joint_vel: 2.0 rad/s
             pos_vec:   0.3m (preinsert 目标距离量级 ~ <0.5m)
             axis_dot:  1.0  (本身已经在 [-1, +1], 直接除 1 不变)
+            peg_axis / hole_axis: 1.0 (unit vec, 已在 [-1, +1])
         """
         device = self._joint_lower.device
         dtype = torch.float32
@@ -620,7 +646,11 @@ class DualArmPegHoleEnv(IsaacSim):
         joint_vel_scale = torch.full_like(joint_pos_scale, 2.0)
         pos_scale = torch.full((3,), 0.3, device=device, dtype=dtype)
         axis_scale = torch.full((1,), 1.0, device=device, dtype=dtype)
-        return torch.cat([joint_pos_scale, joint_vel_scale, pos_scale, axis_scale])
+        chunks = [joint_pos_scale, joint_vel_scale, pos_scale, axis_scale]
+        if self._use_axis_obs:
+            vec_scale = torch.full((3,), 1.0, device=device, dtype=dtype)
+            chunks.extend([vec_scale, vec_scale])     # peg_axis + hole_axis
+        return torch.cat(chunks)
 
     def _simulation_pre_step(self):
         """每 intermediate step 前注入重力补偿 effort.

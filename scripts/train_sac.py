@@ -133,6 +133,12 @@ def parse_args():
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.03m).")
+    p.add_argument("--use_axis_obs", action="store_true",
+                   help="agent obs 32 → 38 维: 末尾追加 peg_axis[3] + hole_axis[3] "
+                        "(world frame unit vectors). axis_dot 标量缺方向信息, "
+                        "policy 在 14-DoF 动作空间难学 axis 对齐 — 加显式向量解锁这一步. "
+                        "**注意**: obs 维度变了, 32 维 M1' checkpoint 不能 warm-start, "
+                        "必须冷启动重训 M1' (38 维) 后再做 M2.")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -182,6 +188,9 @@ def main():
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
+    # bool flags: 直接读 args, 不能用 None 哨兵 (action="store_true" 默认 False)
+    if args.use_axis_obs:
+        env_kwargs["use_axis_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -269,7 +278,8 @@ def main():
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
     logger.info(f"清理旧 best checkpoint (本次 run 自建): {best_path}")
-    logger.info(f"obs_dim={obs_dim}  act_dim={act_dim}  horizon={mdp.info.horizon}")
+    logger.info(f"obs_dim={obs_dim} ({'+axis_vec' if mdp._use_axis_obs else 'base'})  "
+                f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
@@ -313,6 +323,36 @@ def main():
         logger.info(f"wandb run: {wandb_run.url}")
 
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
+
+    # Epoch-0 eval: warm-start actor 在 *任何训练之前* 的表现. 用来确认 actor
+    # 权重转移真的生效 (actor-only warmstart 后 pos_err 应该接近 M1' 收敛水平).
+    # 如果这里 pos_success_rate 已经接近 0, 后面再讨论训练失败就没意义了 —
+    # actor 转移本身就没成功.
+    if args.load_agent is not None:
+        logger.info("=" * 60)
+        logger.info("[EVAL @ epoch 0] warm-start actor BEFORE 任何 fit / 任何 warmup")
+        with deterministic_policy(agent):
+            ds0 = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
+        m0 = compute_hold_metrics(ds0, mdp, args.hold_success_steps)
+        logger.info(f"  pos_success_rate={m0['pos_success_rate']:.3f}  "
+                    f"pos_err_mean={m0['pos_err_mean']:.4f}m  "
+                    f"axis_err_mean={m0['axis_err_mean']:.4f}  "
+                    f"hold_success_rate={m0['hold_success_rate']:.3f}")
+        logger.info(f"  conditional (pos_in_thresh count={m0['pos_in_thresh_count']}):  "
+                    f"axis_err_in_pos_th_mean={m0['axis_err_in_pos_thresh_mean']:.4f}  "
+                    f"axis_err_in_pos_th_min={m0['axis_err_in_pos_thresh_min']:.4f}")
+        logger.info("=" * 60)
+        if wandb_run is not None:
+            wandb_run.log({
+                "epoch": 0,
+                "warmstart_pos_success_rate": m0["pos_success_rate"],
+                "warmstart_pos_err_mean": m0["pos_err_mean"],
+                "warmstart_axis_err_mean": m0["axis_err_mean"],
+                "warmstart_hold_success_rate": m0["hold_success_rate"],
+                "warmstart_axis_err_in_pos_thresh_mean":
+                    m0["axis_err_in_pos_thresh_mean"]
+                    if m0["pos_in_thresh_count"] > 0 else 0.0,
+            }, step=0)
 
     warmup_vector_steps = math.ceil(INITIAL_REPLAY_SIZE / args.num_envs)
     logger.info("填充 replay buffer: "
@@ -397,6 +437,15 @@ def main():
                     f"axis_err_mean={m['axis_err_mean']:.4f}  "
                     f"axis_gate_mean={m['axis_gate_mean']:.3f}  "
                     f"gated_axis_pen={m['gated_axis_penalty_mean']:.3f}")
+        # 条件指标: 关键证据是 'pos_in_thresh 时 axis_err 是否下降'.
+        # pos_in_thresh_count=0 时 NaN — 用 'n/a' 显示, 避免误读成 0.
+        if m['pos_in_thresh_count'] > 0:
+            cond_str = (f"axis_err_in_pos_th_mean={m['axis_err_in_pos_thresh_mean']:.4f}  "
+                        f"axis_err_in_pos_th_min={m['axis_err_in_pos_thresh_min']:.4f}  "
+                        f"axis_gate_in_pos_th_mean={m['axis_gate_in_pos_thresh_mean']:.3f}")
+        else:
+            cond_str = "axis_err_in_pos_th=n/a (pos_in_thresh_count=0)"
+        logger.info(f"  ↳ pos_in_thresh_count={m['pos_in_thresh_count']}  {cond_str}")
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
@@ -411,6 +460,13 @@ def main():
                 "eval_axis_err_mean": m["axis_err_mean"],
                 "eval_axis_gate_mean": m["axis_gate_mean"],
                 "eval_gated_axis_penalty_mean": m["gated_axis_penalty_mean"],
+                "eval_pos_in_thresh_count": m["pos_in_thresh_count"],
+                "eval_axis_err_in_pos_thresh_mean":
+                    m["axis_err_in_pos_thresh_mean"]
+                    if m["pos_in_thresh_count"] > 0 else float("nan"),
+                "eval_axis_gate_in_pos_thresh_mean":
+                    m["axis_gate_in_pos_thresh_mean"]
+                    if m["pos_in_thresh_count"] > 0 else float("nan"),
                 "alpha": agent._alpha.item(),
                 "absorb_per_epoch": absorb_epoch,
                 "absorb_physx_per_epoch": absorb_physx_epoch,
