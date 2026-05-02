@@ -159,10 +159,12 @@ python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --rew_home 0.0005
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
-# Step 2 / M2: pos + axis. 用 axis-gate + pos_success bonus 修 M1'→M2 断崖,
-# 直接到 ±37° 锥 (axis_th=0.2) 不需要再分 warmup 子阶段.
+# Step 2 / M2: pos + axis. 用 axis-gate + pos_success bonus 修 M1'→M2 断崖.
+# **--actor_only_warmstart 必加**: stage 切换 reward shape 变了, 旧 critic 的 Q
+# 语义已经过时, 会拽坏 actor; 只继承 M1' actor 权重, critic/alpha 冷启更稳.
 python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --load_agent results/best_agent_M1p_32dim_pos10cm.msh \
+    --actor_only_warmstart \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
     --rew_axis 1.0 --success_axis_threshold 0.2 \
@@ -239,6 +241,7 @@ python scripts/archive/check_peghole_asset.py \
 | `--rew_action` | env=0.005 | 动作 L2 惩罚权重 |
 | `--rew_success` | env=2.0 | per-step success bonus |
 | `--load_agent` | None | warm-start checkpoint 路径 |
+| `--actor_only_warmstart` | False | 仅继承 actor 权重, critic/alpha/replay 全冷启动. M2 必加 |
 | `--keep_replay` | False | warm-start 时保留旧 replay buffer (默认清空) |
 | `--n_eval_episodes` | num_envs | 每 epoch 末 eval 的 episode 数, 必须能被 num_envs 整除 |
 | `--render` | False | 打开 IsaacSim 窗口 (无此 flag 即 headless) |

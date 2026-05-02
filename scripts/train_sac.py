@@ -7,6 +7,9 @@ reward 骨架. stage 用 reward 权重 + success_axis_threshold 切换:
     M2  = pos + axis 对齐    --rew_axis 1.0  --success_axis_threshold 0.2
 
 M2 用 --load_agent path/to/M1p_checkpoint.msh 续训, 不用 cold start.
+**强烈建议 M2 加 --actor_only_warmstart**: 只继承 M1' actor 权重, critic/alpha 冷启动.
+旧 critic 是按旧 M1' reward 学的, 用到 M2 reward 上 Q 语义已经错了, 会把 actor 从
+M1' 学到的 manifold 拽走. 全量 warm-start 留作"reward 没大改"时用.
 (若直接到 0.2 太难, 可以先 warmup 短跑 0.5 当 debug, 但不作为正式 stage.)
 
 运行:
@@ -111,6 +114,12 @@ def parse_args():
                    help="warm-start 时保留旧 replay buffer. 默认会清空 — 因为 stage "
                         "切换 (M1'→M2) reward 函数变了, 旧 transitions 的 "
                         "reward 标签按旧 reward 算, 留着会拖 critic.")
+    p.add_argument("--actor_only_warmstart", action="store_true",
+                   help="warm-start 时只继承 actor (mu/sigma 网络) 权重, critic / "
+                        "alpha / optimizers / replay buffer 全部冷启动. stage 切换"
+                        "(M1'→M2 reward shape 变化) 时强烈建议打开 — 否则旧 critic "
+                        "按旧 reward 学的 Q 语义会拖坏 actor (M2 一上来 actor 就被拽离 "
+                        "M1' learned manifold). 此 flag 打开时 --keep_replay 自动失效.")
     p.add_argument("--terminal_hold_bonus", type=float, default=None,
                    help="hold-N 步成功后的终结 bonus + episode 终止. "
                         "0 = 关闭 (baseline). >0 启用 absorbing termination.")
@@ -187,24 +196,7 @@ def main():
     if target_entropy is None:
         target_entropy = -float(act_dim)
 
-    if args.load_agent is not None:
-        # Warm-start: 加载已有 agent 的 actor/critic/optimizer (+ replay buffer).
-        # obs 维度必须匹配 (32 维); 加载 31 维老 checkpoint 会在 forward 时抛 shape 错.
-        load_path = Path(args.load_agent)
-        if not load_path.is_file():
-            raise FileNotFoundError(f"--load_agent 路径不存在: {load_path}")
-        agent = Agent.load(str(load_path))
-        print(f"[WARM-START] 已加载 agent from {load_path}")
-        # 默认清空 replay buffer: stage 切换 (M1'→M2) reward 函数变了,
-        # 旧 transitions 的 reward 标签按旧 reward 算的, 留下来会拖 critic. 仅在
-        # 用户显式 --keep_replay 时保留.
-        if not args.keep_replay:
-            agent._replay_memory.reset()
-            print("[WARM-START] replay buffer 已清空 — 重新走 INITIAL_REPLAY_SIZE 填充. "
-                  "若要保留旧 buffer, 加 --keep_replay.")
-        else:
-            print("[WARM-START] 保留旧 replay buffer (--keep_replay).")
-    else:
+    def _cold_create_sac():
         actor_params = dict(network=ActorNetwork, input_shape=(obs_dim,),
                             output_shape=(act_dim,))
         actor_optimizer = {"class": optim.Adam, "params": {"lr": args.lr_actor}}
@@ -212,8 +204,7 @@ def main():
                              output_shape=(1,), action_dim=act_dim,
                              optimizer={"class": optim.Adam, "params": {"lr": args.lr_critic}},
                              loss=F.mse_loss)
-
-        agent = SAC(
+        return SAC(
             mdp_info=mdp.info,
             actor_mu_params=actor_params,
             actor_sigma_params=actor_params,
@@ -228,6 +219,42 @@ def main():
             use_log_alpha_loss=True,
             target_entropy=target_entropy,
         )
+
+    if args.load_agent is not None:
+        load_path = Path(args.load_agent)
+        if not load_path.is_file():
+            raise FileNotFoundError(f"--load_agent 路径不存在: {load_path}")
+        old_agent = Agent.load(str(load_path))
+
+        if args.actor_only_warmstart:
+            # Cold-create 一个新 SAC (匹配当前 M2 reward / env), 然后只把旧 actor
+            # (mu / sigma 网络) 的权重拷过来. critic / alpha / optimizers / replay
+            # 全部新, 避免旧 critic 用过时 Q 语义拽 actor.
+            agent = _cold_create_sac()
+            agent.policy._mu_approximator.set_weights(
+                old_agent.policy._mu_approximator.get_weights()
+            )
+            agent.policy._sigma_approximator.set_weights(
+                old_agent.policy._sigma_approximator.get_weights()
+            )
+            print(f"[WARM-START actor-only] 仅继承 M1' actor 权重 from {load_path}; "
+                  "critic / alpha / replay 全部冷启动.")
+            if args.keep_replay:
+                print("[WARM-START actor-only] --keep_replay 已忽略 (replay 强制冷启).")
+            del old_agent  # 释放旧 agent 引用
+        else:
+            # 全量 warm-start: 继承 actor + critic + optimizer + alpha (+ optionally replay).
+            # obs 维度必须匹配 (32 维); 加载 31 维老 checkpoint 会在 forward 时抛 shape 错.
+            agent = old_agent
+            print(f"[WARM-START full] 整体加载 agent from {load_path}")
+            if not args.keep_replay:
+                agent._replay_memory.reset()
+                print("[WARM-START full] replay buffer 已清空 — 重新走 INITIAL_REPLAY_SIZE 填充. "
+                      "若要保留旧 buffer, 加 --keep_replay.")
+            else:
+                print("[WARM-START full] 保留旧 replay buffer (--keep_replay).")
+    else:
+        agent = _cold_create_sac()
     def clamp_alpha(_dataset=None):
         with torch.no_grad():
             agent._log_alpha.clamp_(max=math.log(args.alpha_max))
