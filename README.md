@@ -159,17 +159,19 @@ python scripts/train_sac.py --no_wandb --n_epochs 200 \
     --rew_home 0.0005
 cp results/best_agent.msh results/best_agent_M1p_32dim_pos10cm.msh
 
-# 单 stage cold-start (rotvec obs, axis-gate 关, 推荐 M2 主线):
-# - 34 维 obs (rotvec_error 替换 axis_dot): 直接给 SO(3) 误差控制方向信号
-# - axis_gate_radius=inf: axis 项始终有信号, 远处也能学转 wrist
-# - lr_actor=1e-4, alpha_max=0.2, target_entropy=-7 (default): 不再让 SAC 锁死
-# - success_axis_threshold 用弧度 (rotvec 模长), 0.65 ≈ 旧 ±37° 锥
+# 单 stage cold-start (axis_resid obs, axis-gate 关, 推荐 M2 主线):
+# - 34 维 obs (axis_resid=peg_axis+hole_axis 替换 axis_dot):
+#   全程光滑无奇异, 模长 ∈ [0,2], 方向告诉 policy peg 当前朝向
+#   axis_err = ||resid||²/2 = 1+dot 与 reward 同语义, 阈值仍用旧 0.2 (≈±37° 锥)
+# - axis_gate_radius=inf (默认): axis 项始终有信号, 远处也能学转 wrist
+# - SAC 参数显式传 cold-start 推荐值 (default 是 warm-start 友好的)
 python scripts/train_sac.py --no_wandb --n_epochs 500 \
-    --use_rotvec_obs \
+    --use_axis_resid_obs \
     --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \
     --rew_home 0.0005 \
-    --rew_axis 0.3 --success_axis_threshold 0.65 \
-    --rew_pos_success 1.0
+    --rew_axis 0.3 --success_axis_threshold 0.2 \
+    --rew_pos_success 1.0 \
+    --lr_actor 1e-4 --alpha_max 0.2 --target_entropy -7
 # 不需要 --axis_gate_radius (默认 inf), 不需要 --load_agent (cold start).
 
 # Step 2 / M2: pos + axis. 用 axis-gate + pos_success bonus 修 M1'→M2 断崖.
@@ -257,7 +259,7 @@ python scripts/archive/check_peghole_asset.py \
 | `--actor_only_warmstart` | False | 仅继承 actor 权重, critic/alpha/replay 全冷启动. M2 必加 |
 | `--keep_replay` | False | warm-start 时保留旧 replay buffer (默认清空) |
 | `--use_axis_obs` | False | 32→38 维 obs (加 peg_axis + hole_axis). 历史诊断 |
-| `--use_rotvec_obs` | False | 32→34 维 obs (rotvec_error 替换 axis_dot). M2 推荐, 互斥于 use_axis_obs |
+| `--use_axis_resid_obs` | False | 32→34 维 obs (axis_resid=peg+hole 替换 axis_dot). M2 推荐, 互斥于 use_axis_obs |
 | `--n_eval_episodes` | num_envs | 每 epoch 末 eval 的 episode 数, 必须能被 num_envs 整除 |
 | `--render` | False | 打开 IsaacSim 窗口 (无此 flag 即 headless) |
 | `--seed` | 42 | torch + numpy seed |

@@ -160,22 +160,25 @@ HOLE_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 
 # Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper.
 # 三种布局:
-#   BASE (32 维):  joint_pos + joint_vel + pos_vec + axis_dot
-#   AXIS (38 维):  BASE + peg_axis + hole_axis (历史诊断用)
-#   ROTVEC (34 维): joint_pos + joint_vel + pos_vec + rotvec_error
-#                   rotvec_error[3] = peg_axis 旋到 -hole_axis 的最小旋转向量
-#                   (轴 × 角度), 在 SO(3) 上几乎处处光滑, 直接告诉 policy
-#                   "wrist 该绕哪个世界轴转、转多少". 当前 M2 默认.
+#   BASE (32 维):    joint_pos + joint_vel + pos_vec + axis_dot
+#   AXIS (38 维):    BASE + peg_axis + hole_axis (历史诊断, peg/hole 各自 3D)
+#   AXIS_RESID (34 维): joint_pos + joint_vel + pos_vec + axis_resid
+#                       axis_resid[3] = peg_axis + hole_axis (world frame).
+#                       ||axis_resid|| = 2·|cos(θ_to_target/2)|, 0 = 完美反对齐,
+#                       2 = 同向 (home pose). 全程光滑, 无 SO(3) ±π 奇异.
+#                       注: 早先尝试过 rotvec = peg×(-hole)·(θ/sinθ), 但
+#                       home pose 处 peg≈hole 让 cross=0, rotvec 编码成 0
+#                       与最大误差矛盾. axis_resid 没这个问题.
 _AGENT_OBS_JOINT_POS = slice(0, 14)
 _AGENT_OBS_JOINT_VEL = slice(14, 28)
 _AGENT_OBS_POS_VEC = slice(28, 31)
 _AGENT_OBS_AXIS_DOT = slice(31, 32)         # BASE / AXIS 用
 _AGENT_OBS_PEG_AXIS = slice(32, 35)         # 仅 AXIS
 _AGENT_OBS_HOLE_AXIS = slice(35, 38)        # 仅 AXIS
-_AGENT_OBS_ROTVEC = slice(31, 34)           # 仅 ROTVEC (替换 axis_dot)
+_AGENT_OBS_AXIS_RESID = slice(31, 34)       # 仅 AXIS_RESID (替换 axis_dot)
 AGENT_OBS_DIM_BASE = 32
 AGENT_OBS_DIM_AXIS = 38
-AGENT_OBS_DIM_ROTVEC = 34
+AGENT_OBS_DIM_AXIS_RESID = 34
 
 DEFAULT_PREINSERT_OFFSET = 0.05
 
@@ -218,11 +221,12 @@ class DualArmPegHoleEnv(IsaacSim):
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
         # obs 模式 (互斥, 至多一个为 True):
-        #   use_axis_obs=True   → 38 维 (peg_axis + hole_axis 进 obs, 历史诊断)
-        #   use_rotvec_obs=True → 34 维 (rotvec_error 替换 axis_dot, 当前 M2 推荐)
-        #   都 False            → 32 维 base (axis_dot 标量, M1' 默认)
+        #   use_axis_obs=True       → 38 维 (peg_axis + hole_axis 进 obs, 历史诊断)
+        #   use_axis_resid_obs=True → 34 维 (peg_axis+hole_axis 求和替换 axis_dot,
+        #                              全程光滑无奇异, 当前 M2 推荐)
+        #   都 False                → 32 维 base (axis_dot 标量, M1' 默认)
         use_axis_obs=False,
-        use_rotvec_obs=False,
+        use_axis_resid_obs=False,
         usd_path=None,
     ):
         self._action_scale = action_scale
@@ -270,11 +274,11 @@ class DualArmPegHoleEnv(IsaacSim):
         self._proxy_arm_radius = float(proxy_arm_radius)
         self._proxy_ee_radius = float(proxy_ee_radius)
         self._use_axis_obs = bool(use_axis_obs)
-        self._use_rotvec_obs = bool(use_rotvec_obs)
-        if self._use_axis_obs and self._use_rotvec_obs:
-            raise ValueError("use_axis_obs 与 use_rotvec_obs 互斥, 不能同时打开")
-        if self._use_rotvec_obs:
-            self._agent_obs_dim = AGENT_OBS_DIM_ROTVEC
+        self._use_axis_resid_obs = bool(use_axis_resid_obs)
+        if self._use_axis_obs and self._use_axis_resid_obs:
+            raise ValueError("use_axis_obs 与 use_axis_resid_obs 互斥, 不能同时打开")
+        if self._use_axis_resid_obs:
+            self._agent_obs_dim = AGENT_OBS_DIM_AXIS_RESID
         elif self._use_axis_obs:
             self._agent_obs_dim = AGENT_OBS_DIM_AXIS
         else:
@@ -436,13 +440,12 @@ class DualArmPegHoleEnv(IsaacSim):
         jv_high = raw_high[jv_idx].to(dtype)
         pos_lo = torch.full((3,), -5.0, device=jp_low.device, dtype=dtype)
         pos_hi = torch.full((3,), 5.0, device=jp_low.device, dtype=dtype)
-        if self._use_rotvec_obs:
-            # rotvec_error 模长 ≤ π. 上下界给 ±π 即可.
-            import math as _m
-            rot_lo = torch.full((3,), -_m.pi, device=jp_low.device, dtype=dtype)
-            rot_hi = torch.full((3,), _m.pi, device=jp_low.device, dtype=dtype)
-            chunks_low = [jp_low, jv_low, pos_lo, rot_lo]
-            chunks_high = [jp_high, jv_high, pos_hi, rot_hi]
+        if self._use_axis_resid_obs:
+            # axis_resid = peg_axis + hole_axis, 每分量 ∈ [-2, +2] (两个单位向量和).
+            resid_lo = torch.full((3,), -2.0, device=jp_low.device, dtype=dtype)
+            resid_hi = torch.full((3,), +2.0, device=jp_low.device, dtype=dtype)
+            chunks_low = [jp_low, jv_low, pos_lo, resid_lo]
+            chunks_high = [jp_high, jv_high, pos_hi, resid_hi]
         else:
             axis_lo = torch.full((1,), -1.0, device=jp_low.device, dtype=dtype)
             axis_hi = torch.full((1,), 1.0, device=jp_low.device, dtype=dtype)
@@ -491,38 +494,23 @@ class DualArmPegHoleEnv(IsaacSim):
         preinsert_target = hole_entry + self._preinsert_offset * hole_axis
         pos_vec = peg_tip - preinsert_target
 
-        # axis_dot ∈ [-1, +1], -1 = 完美对齐.
+        # axis_dot ∈ [-1, +1], -1 = 完美对齐. axis_err = 1 + axis_dot ∈ [0, 2].
+        # 三种 obs 模式都用同一个 axis_err 语义 (1+dot), 让 reward / eval / viz
+        # / success_axis_threshold 全程一致, 避免 rad-vs-(1+dot) 量纲混淆.
         axis_dot = (peg_axis * hole_axis).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
-
-        # axis_err 语义统一为 "目标角度":
-        #   rotvec 模式: 直接用 acos(-dot) ∈ [0, π], 与 obs rotvec 模长一致.
-        #   非 rotvec : 沿用旧约定 1 + dot ∈ [0, 2].
-        # success_axis_threshold 必须按当前模式给值 (rotvec 用 0.2 rad ≈ 11°,
-        # 旧 axis_err 0.2 ≈ 1+dot=0.2 ⇒ dot=-0.8 ≈ 36° 锥, 不一样, 注意).
-        if self._use_rotvec_obs:
-            axis_err = torch.acos((-axis_dot).clamp(-1.0, 1.0)).squeeze(-1)
-        else:
-            axis_err = 1.0 + axis_dot.squeeze(-1)
+        axis_err = 1.0 + axis_dot.squeeze(-1)
 
         # cache 给 is_absorbing / reward 复用 (避免再算一遍 quat 旋转).
         # M3+ 想加 radial_vec / axial_dist 时, 在这里 cache 即可.
         self._cached_pos_vec = pos_vec
         self._cached_axis_err = axis_err
 
-        if self._use_rotvec_obs:
-            # rotvec_error: 把 peg_axis 旋转到 -hole_axis (反平行 = 完美对齐) 所需
-            # 的最小旋转向量. 模长 = 角度 ∈ [0, π], 方向 = 旋转轴 (世界系).
-            # 推导: target = -hole_axis. cos θ = peg · target = -axis_dot.
-            #       axis = peg × target / sin θ; rotvec = axis · θ.
-            # 数值实现: rotvec = peg × (-hole_axis) · (θ / sin θ).
-            target = -hole_axis
-            cross = torch.cross(peg_axis, target, dim=-1)
-            cos_theta = (peg_axis * target).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
-            theta = torch.acos(cos_theta)                          # [N, 1]
-            sin_theta = torch.sin(theta).clamp_min(1e-6)
-            rotvec = cross * (theta / sin_theta)                   # [N, 3]
-            self._cached_rotvec = rotvec                           # 给 reward 用
-            return torch.cat([joint_pos, joint_vel, pos_vec, rotvec], dim=-1)
+        if self._use_axis_resid_obs:
+            # axis_resid = peg_axis + hole_axis. 同向 (home pose) 模长 2,
+            # 反向 (完美对齐) 模长 0. 信息上等价于 axis_dot 但 3D 带方向,
+            # 全程光滑无奇异. ||resid||² = 2·(1 + dot) = 2·axis_err.
+            axis_resid = peg_axis + hole_axis
+            return torch.cat([joint_pos, joint_vel, pos_vec, axis_resid], dim=-1)
 
         if self._use_axis_obs:
             return torch.cat(
@@ -544,10 +532,11 @@ class DualArmPegHoleEnv(IsaacSim):
         """
         pos_vec = agent_obs[..., _AGENT_OBS_POS_VEC]
         pos_err = torch.norm(pos_vec, dim=-1)
-        if self._use_rotvec_obs:
-            # rotvec 模长就是夹角 ∈ [0, π]. axis_err 仍报这个角度供 success / log.
-            rotvec = agent_obs[..., _AGENT_OBS_ROTVEC]
-            axis_err = torch.norm(rotvec, dim=-1)
+        if self._use_axis_resid_obs:
+            # axis_resid = peg + hole, ||resid||² = 2·(1 + dot) = 2·axis_err.
+            # 反算 axis_err 与 reward / _cached_axis_err 同语义 (1 + dot).
+            resid = agent_obs[..., _AGENT_OBS_AXIS_RESID]
+            axis_err = (resid * resid).sum(dim=-1) / 2.0
         else:
             # axis_dot 已经在 obs 里 [-1, +1]; axis_err = 1 + axis_dot ∈ [0, 2].
             axis_dot = agent_obs[..., _AGENT_OBS_AXIS_DOT].squeeze(-1)
@@ -684,23 +673,26 @@ class DualArmPegHoleEnv(IsaacSim):
     def get_obs_scale(self):
         """32 / 34 / 38 维 fixed-divisor 归一化向量, 与 agent obs 一一对应.
 
+        注: 当前 train_sac 的 ActorNetwork / CriticNetwork 直接用 raw obs,
+        没有把 obs_scale 接进去, 这个函数现在只供后续手动归一化或 wrap
+        使用. 保留是为了文档化每维的合理量级.
+
         缩放选择 (大致让每维标准差落到 ~1):
             joint_pos: 半关节范围
             joint_vel: 2.0 rad/s
             pos_vec:   0.3m (preinsert 目标距离量级 ~ <0.5m)
-            axis_dot:  1.0   (本身已经在 [-1, +1], 直接除 1 不变)
-            peg_axis / hole_axis: 1.0 (unit vec, 已在 [-1, +1])
-            rotvec_error: π (模长 ∈ [0, π], 除以 π 后落到 ~[0, 1])
+            axis_dot:  1.0  (∈ [-1, +1], 不变)
+            peg_axis / hole_axis: 1.0 (unit vec)
+            axis_resid: 1.0 (peg + hole, 模长 ∈ [0, 2])
         """
-        import math as _m
         device = self._joint_lower.device
         dtype = torch.float32
         joint_pos_scale = 0.5 * (self._joint_upper - self._joint_lower).to(dtype)
         joint_vel_scale = torch.full_like(joint_pos_scale, 2.0)
         pos_scale = torch.full((3,), 0.3, device=device, dtype=dtype)
-        if self._use_rotvec_obs:
-            rot_scale = torch.full((3,), _m.pi, device=device, dtype=dtype)
-            return torch.cat([joint_pos_scale, joint_vel_scale, pos_scale, rot_scale])
+        if self._use_axis_resid_obs:
+            resid_scale = torch.full((3,), 1.0, device=device, dtype=dtype)
+            return torch.cat([joint_pos_scale, joint_vel_scale, pos_scale, resid_scale])
         axis_scale = torch.full((1,), 1.0, device=device, dtype=dtype)
         chunks = [joint_pos_scale, joint_vel_scale, pos_scale, axis_scale]
         if self._use_axis_obs:

@@ -1,7 +1,7 @@
 from .dual_arm_peg_hole_env import (
     AGENT_OBS_DIM_AXIS,
+    AGENT_OBS_DIM_AXIS_RESID,
     AGENT_OBS_DIM_BASE,
-    AGENT_OBS_DIM_ROTVEC,
     DEFAULT_PREINSERT_OFFSET,
     DualArmPegHoleEnv,
 )
@@ -13,7 +13,7 @@ __all__ = [
     "AGENT_OBS_DIM",
     "AGENT_OBS_DIM_BASE",
     "AGENT_OBS_DIM_AXIS",
-    "AGENT_OBS_DIM_ROTVEC",
+    "AGENT_OBS_DIM_AXIS_RESID",
     "DEFAULT_PREINSERT_OFFSET",
     "DualArmPegHoleEnv",
 ]
