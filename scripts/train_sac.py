@@ -78,6 +78,14 @@ def parse_args():
                    help="目标 entropy. 默认自动取 -act_dim (SAC 标准). "
                         "14-DoF cold-start 联合任务可考虑 -7 (= -act_dim/2), "
                         "让 SAC 倾向稍集中, alpha 不顶 cap.")
+    p.add_argument("--critic_warmup_transitions", type=int, default=None,
+                   help="actor 开始更新前需要的 replay 容量 (env-steps). 默认 = "
+                        "INITIAL_REPLAY_SIZE (10K), 即 critic 仅领先 actor 1 步, "
+                        "等价无 critic-only warmup. **actor-only warmstart 推荐设大** "
+                        "(e.g. 50000 ≈ 40 epoch), 让冷启动的 critic 先用 warm-start "
+                        "actor 收集的 trajectories 单独把 Q 学到合理量级, 再放开 actor, "
+                        "避免随机 critic 把转移过来的 actor 推离 M1' manifold. "
+                        "必须 >= INITIAL_REPLAY_SIZE.")
     p.add_argument("--n_eval_episodes", type=int, default=None,
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
     p.add_argument("--initial_joint_noise", type=float, default=None,
@@ -181,6 +189,14 @@ def main():
             f"n_steps_per_epoch ({args.n_steps_per_epoch}) 必须能被 "
             f"n_steps_per_fit ({args.n_steps_per_fit}) 整除"
         )
+    if args.critic_warmup_transitions is None:
+        args.critic_warmup_transitions = INITIAL_REPLAY_SIZE
+    if args.critic_warmup_transitions < INITIAL_REPLAY_SIZE:
+        raise ValueError(
+            f"--critic_warmup_transitions ({args.critic_warmup_transitions}) 必须 >= "
+            f"INITIAL_REPLAY_SIZE ({INITIAL_REPLAY_SIZE}); 否则 replay 还没 initialized "
+            "actor gate 已经打开, 设置无意义."
+        )
     args.n_eval_episodes = resolve_eval_episode_count(
         args.n_eval_episodes, args.num_envs, "--n_eval_episodes"
     )
@@ -231,7 +247,7 @@ def main():
             batch_size=BATCH_SIZE,
             initial_replay_size=INITIAL_REPLAY_SIZE,
             max_replay_size=MAX_REPLAY_SIZE,
-            warmup_transitions=INITIAL_REPLAY_SIZE,
+            warmup_transitions=args.critic_warmup_transitions,
             tau=0.005,
             lr_alpha=args.lr_alpha,
             use_log_alpha_loss=True,
@@ -281,12 +297,24 @@ def main():
 
     results_dir = PROJECT_ROOT / "results"
     results_dir.mkdir(exist_ok=True)
-    best_path = results_dir / "best_agent.msh"
-    if best_path.exists():
-        best_path.unlink()
+    # 三种 checkpoint, 各自独立追踪, 互不覆盖:
+    #   best_J.msh        - 最高 discounted return J (=best_agent.msh 的别名, 向后兼容)
+    #   best_hold.msh     - 最高 hold_success_rate (出现 hold 之后才会写入)
+    #   final_agent.msh   - 训练结束时无条件保存最后一个 epoch 的 actor
+    # 防止 "终态稳定 hold=1.0 但 J 没破 best_J 上限" 这种情况下 best_agent 锁在
+    # 早期低 hold 的快照, 独立 eval 评的不是真实最终策略.
+    best_J_path = results_dir / "best_agent.msh"
+    best_hold_path = results_dir / "best_hold.msh"
+    final_path = results_dir / "final_agent.msh"
+    for p in (best_J_path, best_hold_path, final_path):
+        if p.exists():
+            p.unlink()
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
-    logger.info(f"清理旧 best checkpoint (本次 run 自建): {best_path}")
+    logger.info(
+        f"清理旧 checkpoint (本次 run 自建): {best_J_path.name}, "
+        f"{best_hold_path.name}, {final_path.name}"
+    )
     if mdp._use_axis_resid_obs:
         obs_mode = "axis_resid"
     elif mdp._use_axis_obs:
@@ -309,6 +337,19 @@ def main():
     logger.info(f"target_entropy={target_entropy:.3f}  "
                 f"lr_actor={args.lr_actor:.1e}  lr_critic={args.lr_critic:.1e}  "
                 f"lr_alpha={args.lr_alpha:.1e}  alpha_max={args.alpha_max:.3f}")
+    critic_only_steps = args.critic_warmup_transitions - INITIAL_REPLAY_SIZE
+    if critic_only_steps > 0:
+        critic_only_epochs = critic_only_steps / args.n_steps_per_epoch
+        logger.info(
+            f"critic_warmup_transitions={args.critic_warmup_transitions} env-steps "
+            f"(replay-fill {INITIAL_REPLAY_SIZE} + critic-only {critic_only_steps} ≈ "
+            f"{critic_only_epochs:.1f} epoch, actor 此期间冻结)"
+        )
+    else:
+        logger.info(
+            f"critic_warmup_transitions={args.critic_warmup_transitions} env-steps "
+            "(无 critic-only 期, actor 与 critic 几乎同时开启)"
+        )
     logger.info(f"n_steps_per_epoch={args.n_steps_per_epoch} env-steps  "
                 f"n_steps_per_fit={args.n_steps_per_fit} env-steps  "
                 f"num_envs={args.num_envs}")
@@ -388,7 +429,11 @@ def main():
 
     best_J = -np.inf
     best_score = -np.inf
-    use_J_for_best = mdp._terminal_hold_bonus > 0
+    # best_hold 用 (hold_success_rate, max_hold_mean) 二级 key:
+    # hold_success_rate 是首要指标 (0-1, 大多数 epoch 是 0), max_hold_mean 当 tie-breaker
+    # (0-N, hold rate 相同时偏好平均 hold 更长的). 两者都要 > 之前才更新.
+    best_hold_rate = -1.0  # 用 -1 而非 0, 让首次出现 hold_rate=0.0 时不会触发"改进"
+    best_hold_score = -1.0  # tie-breaker: max_hold_mean
     total_env_steps = INITIAL_REPLAY_SIZE
     absorb_prev = mdp._absorb_count
     absorb_physx_prev = mdp._absorb_count_physx
@@ -419,25 +464,33 @@ def main():
         improved_J = J > best_J
         if improved_J:
             best_J = J
+            agent.save(str(best_J_path))
         score = m['hold_success_rate'] * m['max_hold_mean']
         improved_score = m['hold_success_rate'] > 0 and score > best_score
         if improved_score:
             best_score = score
-        # M1 初期可能长期没有 hold success, 但 dense pos_err reward 已经在改善.
-        # 在 best_score 还没变成有限值前, 先按 best_J 保存, 避免短跑/早期实验没有
-        # best_agent.msh 可供 visualize/eval 使用; 一旦出现 hold success, 继续回到
-        # hold-score 作为 baseline 的 best 选择标准.
-        save_now = improved_J if use_J_for_best else (
-            improved_score or (best_score == -np.inf and improved_J)
+
+        # best_hold 独立追踪: hold_rate 严格超过历史 → 保存; 持平 → 看 max_hold_mean.
+        # 这样能捕到 "终态 hold=1.0 但 J 不再涨" 的稳态策略, 不会被早期高 J 低 hold 覆盖.
+        hold_rate = m['hold_success_rate']
+        max_hold = m['max_hold_mean']
+        improved_hold = (
+            hold_rate > best_hold_rate
+            or (hold_rate == best_hold_rate and max_hold > best_hold_score)
         )
-        if save_now:
-            agent.save(str(results_dir / "best_agent.msh"))
+        # 只有 hold_rate > 0 才写 best_hold.msh, 避免早期 0/0 持平也写一遍
+        if improved_hold and hold_rate > 0:
+            best_hold_rate = hold_rate
+            best_hold_score = max_hold
+            agent.save(str(best_hold_path))
 
         absorb_prev = mdp._absorb_count
         absorb_physx_prev = mdp._absorb_count_physx
         absorb_sphere_prev = mdp._absorb_count_sphere
 
-        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J, best_score=best_score,
+        logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J,
+                          best_hold=best_hold_rate if best_hold_rate >= 0 else 0.0,
+                          best_score=best_score,
                           absorb_epoch=absorb_epoch,
                           absorb_physx=absorb_physx_epoch,
                           absorb_sphere=absorb_sphere_epoch)
@@ -465,6 +518,10 @@ def main():
             wandb_run.log({
                 "epoch": epoch + 1, "env_steps": total_env_steps,
                 "J": J, "R": R, "best_J": best_J, "best_score": best_score,
+                "best_hold_rate":
+                    best_hold_rate if best_hold_rate >= 0 else 0.0,
+                "best_hold_max_hold_mean":
+                    best_hold_score if best_hold_score >= 0 else 0.0,
                 "eval_ep_len": ep_len,
                 "eval_success_rate": m["hold_success_rate"],
                 "eval_max_hold_mean": m["max_hold_mean"],
@@ -488,10 +545,33 @@ def main():
                 "absorb_sphere_per_epoch": absorb_sphere_epoch,
             }, step=epoch + 1)
 
-    logger.info(f"训练完成. best J = {best_J:.3f}  best_score = {best_score:.3f}")
+    # 训练结束时无条件保存最后一个 epoch 的 actor — 这是 "稳态终态" 的 ground truth,
+    # 独立 eval 应当至少评一次它, 跟 best_J / best_hold 对照, 避免 "best_J 锁早期低 hold
+    # 快照, 终态 hold=1.0 但因 J 未破上限被永远丢失" 这类 silent failure.
+    agent.save(str(final_path))
+
+    if best_hold_rate < 0:
+        best_hold_display = "n/a (no hold success)"
+    else:
+        best_hold_display = f"{best_hold_rate:.3f} (max_hold_mean={best_hold_score:.1f})"
+    logger.info(
+        f"训练完成. best J = {best_J:.3f}  "
+        f"best_hold_rate = {best_hold_display}  "
+        f"best_score = {best_score:.3f}"
+    )
+    logger.info(f"checkpoint 写入: {best_J_path.name} (best J) / "
+                f"{best_hold_path.name} (best hold) / {final_path.name} (final). "
+                "**eval 时务必对三个都跑一遍**, best_J 不一定 = 最稳策略.")
+
     if wandb_run is not None:
         wandb_run.summary["best_J"] = best_J
         wandb_run.summary["best_score"] = best_score
+        wandb_run.summary["best_hold_rate"] = (
+            best_hold_rate if best_hold_rate >= 0 else 0.0
+        )
+        wandb_run.summary["best_hold_max_hold_mean"] = (
+            best_hold_score if best_hold_score >= 0 else 0.0
+        )
         wandb_run.finish()
     mdp.stop()
 
