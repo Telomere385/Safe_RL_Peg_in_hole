@@ -1,18 +1,44 @@
-"""train_sac.py 与 eval_sac.py 共用的 eval 工具.
+"""train_sac.py / eval_sac.py / visualize_policy.py 共用的 eval 工具.
 
 - deterministic_policy: SAC 评估时把 tanh-Gaussian 策略替换成 tanh(mu).
 - compute_hold_metrics: 从 evaluate() 返回的 flatten 后的 dataset 算 hold-N
   success 与每步 in-threshold / pos_err / axis_err 统计.
   in_thresh = (pos_err < pos_th) ∧ (axis_err < axis_th); axis_th=inf 退化为
-  pos-only (M1' 行为). 同时单独报 pos_success_rate (只看 pos<pos_th, 反映
-  M1' 已学技能保住没) 与 axis_gate_mean (axis 项实际被门控到几成).
+  pos-only (Stage 1 行为). 同时单独报 pos_success_rate (只看 pos<pos_th, 反映
+  Stage 1 已学技能保住没) 与 axis_gate_mean (axis 项实际被门控到几成).
+- parse_home_weights: argparse type=, 接受 7/14 维 float 列表 (逗号或空格分隔).
+- resolve_eval_episode_count: 让 eval episode 数与 num_envs 对齐.
 """
 
+import argparse
 import math
 from contextlib import contextmanager
 
 import numpy as np
 import torch
+
+
+def parse_home_weights(value):
+    """argparse type=: 接受 7 维(单臂, 自动复制到左右臂)或 14 维 float 列表,
+    逗号或空格分隔. 例如 '1,1,1,1,0.5,0.25,0.25'.
+    """
+    raw = value.replace(",", " ").split()
+    try:
+        weights = tuple(float(x) for x in raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            "--home_weights 必须是逗号或空格分隔的 float 列表"
+        ) from e
+    if len(weights) not in (7, 14):
+        raise argparse.ArgumentTypeError(
+            f"--home_weights 必须是 7 维(单臂)或 14 维, 当前 {len(weights)} 维"
+        )
+    bad = [i for i, w in enumerate(weights) if not math.isfinite(w) or w < 0.0]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"--home_weights 必须是有限非负数, 非法索引 {bad}"
+        )
+    return weights
 
 
 @contextmanager
@@ -37,7 +63,7 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
     """`hold_success` = episode 内出现长度 >= N 的连续 in-threshold 段.
 
     in-threshold = (pos_err < pos_th) ∧ (axis_err < axis_th). axis_th=inf 时
-    退化为 pos-only (M1' 行为).
+    退化为 pos-only (Stage 1 行为).
 
     依赖 VectorCore.evaluate 末尾返回的 dataset 是 flatten 后的 1D, 每个 env 的
     transitions 在结果里连续, 所以 `flatnonzero(last)` + 顺序切片就能正确分段.
@@ -93,7 +119,7 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
         "final_in_thresh_rate": float(np.mean(ep_final_in_thresh)) if ep_final_in_thresh else 0.0,
         "pos_err_mean": float(pos_err.mean()),
         "axis_err_mean": float(axis_err.mean()),
-        # M1' pos 技能保住程度 — 不被 full success (pos∧axis) 掩盖.
+        # Stage 1 pos 技能保住程度 — 不被 full success (pos∧axis) 掩盖.
         "pos_success_rate": float(pos_in_thresh.float().mean()),
         # axis 项实际被门控的程度. ≈0 = 还远, axis 不施压; ≈1 = 进 pos 阈, axis 满压.
         "axis_gate_mean": float(axis_gate.mean()),

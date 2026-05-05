@@ -1,23 +1,9 @@
-"""评估训练好的 SAC agent (32 维 obs, stage flag 化 reward).
+"""评估训练好的 SAC agent (32 维 base / 34 维 axis_resid, stage flag 化 reward).
 
-eval 时 --rew_axis / --success_axis_threshold 应与训练时保持一致, 否则
-success / hold-N 触发条件不同, 数字没有可比性.
+eval 时 --rew_axis / --success_axis_threshold / --use_axis_resid_obs 等应与训练
+时保持一致, 否则 success / hold-N 触发条件不同, 数字没有可比性.
 
-运行:
-    conda activate safe_rl
-    # M1' (pos-only)
-    python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \\
-        --agent_path results/best_agent_M1p_32dim_pos10cm.msh \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
-        --rew_home 0.0005
-
-    # M2 (pos + axis, axis-gate + pos_success bonus)
-    python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \\
-        --agent_path results/best_agent_M2_axis02.msh \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
-        --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2 \\
-        --rew_pos_success 1.0 --axis_gate_radius 0.40
+正式 Stage 1 / Stage 2 eval 命令见 README.md "Eval 命令" 段.
 """
 
 import argparse
@@ -32,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from scripts._eval_utils import (
     compute_hold_metrics,
     deterministic_policy,
+    parse_home_weights,
     resolve_eval_episode_count,
 )
 
@@ -54,13 +41,19 @@ def parse_args():
                    help="覆盖 env 默认 preinsert offset. 应传与 train 相同的值")
     p.add_argument("--rew_axis", type=float, default=None,
                    help="覆盖 env 的 axis_err 权重. hold 指标不依赖 reward, 但 J/R 会依赖; "
-                        "应与 train 一致. 默认 0 = M1' 行为.")
+                        "应与 train 一致. 默认 0 = Stage 1 行为.")
+    p.add_argument("--rew_success", type=float, default=None,
+                   help="覆盖 env 的 per-step full_success (pos∧axis) bonus. "
+                        "评估 J/R 时应与 train 一致.")
     p.add_argument("--rew_pos_success", type=float, default=None,
                    help="覆盖 env 的 pos-only success bonus. 应与 train 一致.")
     p.add_argument("--axis_gate_radius", type=float, default=None,
                    help="覆盖 env 的 axis 距离门控半径. 应与 train 一致.")
     p.add_argument("--rew_home", type=float, default=None,
                    help="覆盖 env 的 home regularizer 权重. 评估 J/R 时应与 train 一致.")
+    p.add_argument("--home_weights", type=parse_home_weights, default=None,
+                   help="home regularizer 的逐关节权重. 应与 train 一致. "
+                        "接受 7 维单臂或 14 维完整权重, 逗号/空格分隔.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
                    help="覆盖 env 默认 axis_err success 阈值. **必须与 train 时一致**, "
                         "否则 hold_success_rate / final_in_thresh_rate 数字不可比.")
@@ -76,11 +69,9 @@ def parse_args():
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
-    p.add_argument("--use_axis_obs", action="store_true",
-                   help="38 维 obs (peg_axis + hole_axis 进 obs). **必须与 train 一致**, "
-                        "否则 actor 输入维度对不上加载会失败.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
-                   help="34 维 obs (axis_resid 替换 axis_dot). **必须与 train 一致**.")
+                   help="34 维 obs (axis_resid 替换 axis_dot). **必须与 train 一致**, "
+                        "否则 actor 输入维度对不上加载会失败.")
     p.add_argument("--stochastic", action="store_true",
                    help="使用 SAC 采样策略评估. 默认使用 deterministic tanh(mu)")
     return p.parse_args()
@@ -96,15 +87,13 @@ def main():
 
     env_kwargs = dict(num_envs=args.num_envs, headless=args.headless)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_axis", "rew_pos_success",
-                "rew_home", "axis_gate_radius",
+                "preinsert_offset", "rew_axis", "rew_success", "rew_pos_success",
+                "rew_home", "home_weights", "axis_gate_radius",
                 "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
-    if args.use_axis_obs:
-        env_kwargs["use_axis_obs"] = True
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps

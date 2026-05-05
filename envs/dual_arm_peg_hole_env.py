@@ -1,25 +1,26 @@
 """双臂 peg-in-hole preinsert 任务 — mushroom-rl IsaacSim 向量化环境.
 
-阶段 (stage flag 化, 同一个 env / 同一个 obs / 同一条 reward 骨架):
-    M1' = pos-only           rew_axis=0,    success_axis_threshold=inf
-    M2  = pos + axis 对齐    rew_axis=1.0,  success_axis_threshold=0.2
-    M3+ = 在 obs 里再加
-          radial/axial 维度 (留给后续 commit, 此版本不放).
+阶段 (stage flag 化, 同一个 env / 同一条 reward 骨架, reward 权重切换):
+    Stage 1 = pos-only         rew_axis=0,   success_axis_threshold=inf
+    Stage 2 = pos + axis 对齐  rew_axis=0.5, success_axis_threshold=0.50
+                              + axis_gate_radius=0.40m + rew_pos_success
+    Stage 3+ = 真插入 (radial/axial reward, 还没实现)
 
-切换 stage 不改 env 结构, 只改 reward 权重和 success_axis_threshold. 这样
-M1' → M2 之间可以 warm-start (--load_agent), 网络输入维度恒为 32.
+切换 stage 不改 env 结构, 只改 reward 权重和 success_axis_threshold. Stage 1
+→ Stage 2 用 --load_agent + --actor_only_warmstart 做 actor 转移, obs 维度
+保持一致 (推荐 --use_axis_resid_obs, 34 维; 默认 32 维 base 是历史 Stage 1 路径).
 
 每臂控全部 7 DoF (A1-A7), 14 维 joint velocity 动作.
 
-观测 (32 维):
+观测 (32 维 base / 34 维 axis_resid, 见 use_axis_resid_obs):
     joint_pos          (14) 左右臂 A1-A7 关节角
     joint_vel          (14) 左右臂 A1-A7 关节角速度
     pos_vec            (3)  peg_tip - preinsert_target
-    axis_dot           (1)  dot(peg_axis, hole_axis) ∈ [-1, +1]
+    axis_dot           (1)  dot(peg_axis, hole_axis) ∈ [-1, +1]   ← 32D base
                             -1 = 完美轴反平行 (理想对齐).
-                            放标量 (而非完整 peg_axis/hole_axis 6 维): 一维已经
-                            把"对齐到什么程度"的梯度信号给出来; 完整向量与 EE
-                            quat 强冗余, 徒增维度.
+    axis_resid         (3)  peg_axis + hole_axis (world frame)    ← 34D, 推荐
+                            模长 ∈ [0,2], 0=完美反对齐, 2=同向.
+                            ||resid||²/2 = 1+dot = axis_err 同语义.
 
 动作 (14):
     action ∈ [-1,1]^14 → joint velocity 指令 (rad/s), 系数 action_scale.
@@ -30,12 +31,12 @@ Reward (统一骨架):
     - w_joint_limit  * joint_limit_norm
     - w_action       * sum(a_i^2)                         # raw action, 解耦 action_scale
     - w_home         * sum( ((q-q_home)/joint_range)^2 )  # 全 stage tie-breaker
-    + w_pos_success  * 1[pos_err < pos_th]                # 防 M1'→M2 success 断崖
+    + w_pos_success  * 1[pos_err < pos_th]                # 防 Stage 1→Stage 2 success 断崖
     + w_success      * 1[full_success]                    # per-step dwell bonus, 不终止
     full_success = (pos_err < pos_th) ∧ (axis_err < axis_th)
-                   # axis_th=inf 时退化为 pos-only — M1' 语义
+                   # axis_th=inf 时退化为 pos-only — Stage 1 语义
     gate = clamp((axis_gate_radius - pos_err) / (axis_gate_radius - pos_th), 0, 1)
-                   # axis_gate_radius=inf 时 gate ≡ 1 (不门控, M1' / 旧行为)
+                   # axis_gate_radius=inf 时 gate ≡ 1 (不门控, Stage 1 / 旧行为)
 
 终止:
     - 自碰撞 (双信号 OR, 任一触发即吸收 r = r_min / (1 - γ)):
@@ -159,28 +160,22 @@ PEG_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 HOLE_AXIS_QUAT_OFFSET = (1.0, 0.0, 0.0, 0.0)
 
 # Agent obs 索引切片 — reward / is_absorbing 直接按位读, 不再走 obs_helper.
-# 三种布局:
-#   BASE (32 维):    joint_pos + joint_vel + pos_vec + axis_dot
-#   AXIS (38 维):    BASE + peg_axis + hole_axis (历史诊断, peg/hole 各自 3D)
+# 两种布局:
+#   BASE (32 维):       joint_pos + joint_vel + pos_vec + axis_dot
 #   AXIS_RESID (34 维): joint_pos + joint_vel + pos_vec + axis_resid
 #                       axis_resid[3] = peg_axis + hole_axis (world frame).
 #                       ||axis_resid|| = 2·|cos(θ_to_target/2)|, 0 = 完美反对齐,
 #                       2 = 同向 (home pose). 全程光滑, 无 SO(3) ±π 奇异.
-#                       注: 早先尝试过 rotvec = peg×(-hole)·(θ/sinθ), 但
-#                       home pose 处 peg≈hole 让 cross=0, rotvec 编码成 0
-#                       与最大误差矛盾. axis_resid 没这个问题.
 _AGENT_OBS_JOINT_POS = slice(0, 14)
 _AGENT_OBS_JOINT_VEL = slice(14, 28)
 _AGENT_OBS_POS_VEC = slice(28, 31)
-_AGENT_OBS_AXIS_DOT = slice(31, 32)         # BASE / AXIS 用
-_AGENT_OBS_PEG_AXIS = slice(32, 35)         # 仅 AXIS
-_AGENT_OBS_HOLE_AXIS = slice(35, 38)        # 仅 AXIS
+_AGENT_OBS_AXIS_DOT = slice(31, 32)         # 仅 BASE
 _AGENT_OBS_AXIS_RESID = slice(31, 34)       # 仅 AXIS_RESID (替换 axis_dot)
 AGENT_OBS_DIM_BASE = 32
-AGENT_OBS_DIM_AXIS = 38
 AGENT_OBS_DIM_AXIS_RESID = 34
 
 DEFAULT_PREINSERT_OFFSET = 0.05
+DEFAULT_HOME_WEIGHTS = (1.0,) * 14
 
 
 class DualArmPegHoleEnv(IsaacSim):
@@ -203,13 +198,14 @@ class DualArmPegHoleEnv(IsaacSim):
         rew_joint_limit=0.02,
         rew_action=0.005,
         rew_home=0.0,
+        home_weights=None,
         success_hold_steps=10,
         terminal_hold_bonus=0.0,
         preinsert_success_pos_threshold=0.10,
         success_axis_threshold=float("inf"),
         # axis-gate: 把 axis 惩罚按距离门控, 远处不干扰位置学习,
         #   靠近 preinsert 才打开. inf = 不门控 (全 stage 一直施压).
-        #   推荐 M2 用 0.40m: 离 preinsert 40cm 起开始线性 ramp,
+        #   推荐 Stage 2 用 0.40m: 离 preinsert 40cm 起开始线性 ramp,
         #   到 pos_th=0.10m 时 gate 满.
         axis_gate_radius=float("inf"),
         joint_limit_margin_frac=0.8,
@@ -220,12 +216,10 @@ class DualArmPegHoleEnv(IsaacSim):
         clearance_hard=0.0,
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
-        # obs 模式 (互斥, 至多一个为 True):
-        #   use_axis_obs=True       → 38 维 (peg_axis + hole_axis 进 obs, 历史诊断)
+        # obs 模式:
         #   use_axis_resid_obs=True → 34 维 (peg_axis+hole_axis 求和替换 axis_dot,
-        #                              全程光滑无奇异, 当前 M2 推荐)
-        #   都 False                → 32 维 base (axis_dot 标量, M1' 默认)
-        use_axis_obs=False,
+        #                              全程光滑无奇异, 当前 Stage 2 推荐)
+        #   False                   → 32 维 base (axis_dot 标量, Stage 1 默认)
         use_axis_resid_obs=False,
         usd_path=None,
     ):
@@ -235,27 +229,45 @@ class DualArmPegHoleEnv(IsaacSim):
         self._r_min = reward_absorbing_r_min
         self._reward_scale = reward_scale
         self._w_pos = rew_pos
-        # rew_axis 默认 0 = M1' 行为 (axis 项消失). M2 通过 CLI 打开.
+        # rew_axis 默认 0 = Stage 1 行为 (axis 项消失). Stage 2 通过 CLI 打开.
         self._w_axis = rew_axis
         self._w_success = rew_success
-        # pos-only success bonus: 维持 M1' 已学会的"进 pos 阈值给 +bonus"信号,
-        # 避免 M2 加 axis 后, M1' 成功状态突然失去 success bonus 造成断崖.
+        # pos-only success bonus: 维持 Stage 1 已学会的"进 pos 阈值给 +bonus"信号,
+        # 避免 Stage 2 加 axis 后, Stage 1 成功状态突然失去 success bonus 造成断崖.
         # full_success (pos ∧ axis) 的 bonus 仍走 _w_success.
         self._w_pos_success = float(rew_pos_success)
         self._w_joint_limit = rew_joint_limit
         self._w_action = rew_action
-        # home regularizer: -w_home · ||(q - q_home) / joint_range||²
-        # 用 joint-range 归一化让不同关节贡献尺度对齐. =0 关闭 (向后兼容).
+        # home regularizer: -w_home · Σ_i home_weight_i ·
+        # ((q_i - q_home_i) / joint_range_i)^2. 默认全 1, 保持旧行为.
         self._w_home = float(rew_home)
+        if home_weights is None:
+            self._home_weights_values = DEFAULT_HOME_WEIGHTS
+        else:
+            weights = tuple(float(w) for w in home_weights)
+            if len(weights) == 7:
+                weights = weights + weights
+            if len(weights) != len(HOME_JOINT_POS):
+                raise ValueError(
+                    "home_weights 必须是 7 维(单臂, 自动复制到左右臂)或 14 维; "
+                    f"传入 {len(weights)} 维: {weights}"
+                )
+            bad = [i for i, w in enumerate(weights) if not math.isfinite(w) or w < 0.0]
+            if bad:
+                raise ValueError(
+                    f"home_weights 必须是有限非负数; 非法索引 {bad}, weights={weights}"
+                )
+            self._home_weights_values = weights
         # hold-N absorbing 设计 (沿用 phase 1): 连续 N 步在阈内即终止 + bonus.
         # bonus=0 时整个机制关闭 (baseline 行为).
         self._success_hold_steps = int(success_hold_steps)
         self._terminal_hold_bonus = float(terminal_hold_bonus)
         self._absorbing_terminal_active = self._terminal_hold_bonus > 0.0
         self._preinsert_success_pos_threshold = float(preinsert_success_pos_threshold)
-        # success_axis_threshold 默认 inf = success 不检查 axis (M1' 行为).
-        # M2 时通过 CLI 设成 0.2. 用 inf 而不是 None 让 success_mask 表达式
-        # 不需要 None-check 分支, 永远是干净的 (pos<pos_th) & (axis_err<axis_th).
+        # success_axis_threshold 默认 inf = success 不检查 axis (Stage 1 行为).
+        # Stage 2 训练阈值 0.50 (严格 eval 可降到 0.30/0.20). 用 inf 而不是 None
+        # 让 success_mask 表达式不需要 None-check 分支, 永远是干净的
+        # (pos<pos_th) & (axis_err<axis_th).
         self._success_axis_threshold = float(success_axis_threshold)
         self._joint_limit_margin_frac = joint_limit_margin_frac
         self._preinsert_offset = float(preinsert_offset)
@@ -273,14 +285,9 @@ class DualArmPegHoleEnv(IsaacSim):
         self._clearance_hard = float(clearance_hard)
         self._proxy_arm_radius = float(proxy_arm_radius)
         self._proxy_ee_radius = float(proxy_ee_radius)
-        self._use_axis_obs = bool(use_axis_obs)
         self._use_axis_resid_obs = bool(use_axis_resid_obs)
-        if self._use_axis_obs and self._use_axis_resid_obs:
-            raise ValueError("use_axis_obs 与 use_axis_resid_obs 互斥, 不能同时打开")
         if self._use_axis_resid_obs:
             self._agent_obs_dim = AGENT_OBS_DIM_AXIS_RESID
-        elif self._use_axis_obs:
-            self._agent_obs_dim = AGENT_OBS_DIM_AXIS
         else:
             self._agent_obs_dim = AGENT_OBS_DIM_BASE
         if not (math.isfinite(self._proxy_arm_radius) and self._proxy_arm_radius > 0.0):
@@ -348,9 +355,12 @@ class DualArmPegHoleEnv(IsaacSim):
         limits = self._task.get_joint_pos_limits()
         self._joint_lower, self._joint_upper = limits[0], limits[1]
         # 不用 USD 自带的 zero pose, 改用 HOME_JOINT_POS (胸前 ready), 避免 reset
-        # center 落在 zero 全展开姿态, M1' 早期探索浪费在无效扇区.
+        # center 落在 zero 全展开姿态, Stage 1 早期探索浪费在无效扇区.
         self._default_joint_pos = torch.tensor(
             HOME_JOINT_POS, device=device, dtype=self._joint_lower.dtype
+        )
+        self._home_weights = torch.tensor(
+            self._home_weights_values, device=device, dtype=self._joint_lower.dtype
         )
         # fail-fast: home pose 必须落在每个关节的 [lower, upper] 内, 不然 reset
         # 那一步 PhysX 会把它 clamp 到边界, 与设计意图不符.
@@ -451,11 +461,6 @@ class DualArmPegHoleEnv(IsaacSim):
             axis_hi = torch.full((1,), 1.0, device=jp_low.device, dtype=dtype)
             chunks_low = [jp_low, jv_low, pos_lo, axis_lo]
             chunks_high = [jp_high, jv_high, pos_hi, axis_hi]
-            if self._use_axis_obs:
-                vec_lo = torch.full((3,), -1.0, device=jp_low.device, dtype=dtype)
-                vec_hi = torch.full((3,), +1.0, device=jp_low.device, dtype=dtype)
-                chunks_low.extend([vec_lo, vec_lo])
-                chunks_high.extend([vec_hi, vec_hi])
         new_obs_low = torch.cat(chunks_low, dim=0)
         new_obs_high = torch.cat(chunks_high, dim=0)
         mdp_info.observation_space = Box(new_obs_low, new_obs_high, data_type=dtype)
@@ -468,14 +473,14 @@ class DualArmPegHoleEnv(IsaacSim):
         return clipped * self._action_scale
 
     def _create_observation(self, obs):
-        """raw obs (42 dim) → agent obs (32 或 38 dim, 取决于 use_axis_obs).
+        """raw obs (42 dim) → agent obs (32 或 34 dim, 取决于 use_axis_resid_obs).
 
         raw 布局 (与 observation_spec 顺序一致):
             joint_pos[14] joint_vel[14] left_ee_pos[3] right_ee_pos[3]
             left_ee_rot[4] right_ee_rot[4]
         agent obs 布局 (见 _AGENT_OBS_* 切片):
             joint_pos[14] joint_vel[14] pos_vec[3] axis_dot[1]                  ← 32D
-            (+ peg_axis[3] + hole_axis[3] 当 use_axis_obs=True)                 ← 38D
+            joint_pos[14] joint_vel[14] pos_vec[3] axis_resid[3]                ← 34D
         """
         joint_pos = self.observation_helper.get_from_obs(obs, "joint_pos")
         joint_vel = self.observation_helper.get_from_obs(obs, "joint_vel")
@@ -511,12 +516,6 @@ class DualArmPegHoleEnv(IsaacSim):
             # 全程光滑无奇异. ||resid||² = 2·(1 + dot) = 2·axis_err.
             axis_resid = peg_axis + hole_axis
             return torch.cat([joint_pos, joint_vel, pos_vec, axis_resid], dim=-1)
-
-        if self._use_axis_obs:
-            return torch.cat(
-                [joint_pos, joint_vel, pos_vec, axis_dot, peg_axis, hole_axis],
-                dim=-1,
-            )
         return torch.cat([joint_pos, joint_vel, pos_vec, axis_dot], dim=-1)
 
     def _compute_task_errors(self, agent_obs):
@@ -527,8 +526,9 @@ class DualArmPegHoleEnv(IsaacSim):
         _create_observation 重新查 EE pose.
 
         success 用 stage flag 控制:
-            success_axis_threshold=inf 时 axis 项恒 True, 退化为 pos-only (M1' 行为).
-            success_axis_threshold=0.2 时变成 pos ∧ axis (M2).
+            success_axis_threshold=inf 时 axis 项恒 True, 退化为 pos-only (Stage 1 行为).
+            success_axis_threshold 取有限值时变成 pos ∧ axis (Stage 2 训练用 0.50,
+            严格 eval 用 0.30 / 0.20).
         """
         pos_vec = agent_obs[..., _AGENT_OBS_POS_VEC]
         pos_err = torch.norm(pos_vec, dim=-1)
@@ -567,7 +567,7 @@ class DualArmPegHoleEnv(IsaacSim):
         self._last_collision_mask = collision
 
         # _create_observation 已 cache pos_vec / axis_err; 在这里只 compose success.
-        # axis_th=inf (M1') 时 axis 项恒 True, success 退化为 pos-only.
+        # axis_th=inf (Stage 1) 时 axis 项恒 True, success 退化为 pos-only.
         pos_err = torch.norm(self._cached_pos_vec, dim=-1)
         axis_err = self._cached_axis_err
         pos_in_thresh = pos_err < self._preinsert_success_pos_threshold
@@ -614,12 +614,12 @@ class DualArmPegHoleEnv(IsaacSim):
         action_sq = (self._last_raw_action ** 2).sum(dim=-1)
 
         # home regularizer: 全 stage 通用的 tie-breaker, 偏好 q_home (胸前 ready).
-        # joint-range 归一化让 14 维贡献尺度一致. w_home=0 时项消失.
+        # joint-range 归一化后逐关节加权; w_home=0 时整项消失.
         joint_range = self._joint_upper - self._joint_lower
         home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
-        home_norm = (home_dev ** 2).sum(dim=-1)
+        home_norm = (self._home_weights.unsqueeze(0) * (home_dev ** 2)).sum(dim=-1)
 
-        # axis-gate: 远处 (pos_err >= gate_radius) 不施加 axis 压力, 保留 M1'
+        # axis-gate: 远处 (pos_err >= gate_radius) 不施加 axis 压力, 保留 Stage 1
         # 学到的位置策略; 进入 [pos_th, gate_radius] 区间后线性 ramp; pos 进阈
         # 后 gate 满. gate_radius=inf 时 gate 恒 1 (向后兼容, 当前 stage 不门控).
         if math.isfinite(self._axis_gate_radius):
@@ -628,9 +628,9 @@ class DualArmPegHoleEnv(IsaacSim):
         else:
             axis_gate = torch.ones_like(pos_err)
 
-        # rew_axis=0 时 axis 项消失, 这就是 M1' 行为. M2 通过 CLI 把它打开.
-        # rew_pos_success>0 维持 M1' 已学到的"进 pos 阈值给 bonus"信号 — 避免
-        # M2 加 axis 后, M1' 成功状态 (pos 进但 axis 未达) 突然失去 bonus 造成断崖.
+        # rew_axis=0 时 axis 项消失, 这就是 Stage 1 行为. Stage 2 通过 CLI 把它打开.
+        # rew_pos_success>0 维持 Stage 1 已学到的"进 pos 阈值给 bonus"信号 — 避免
+        # Stage 2 加 axis 后, Stage 1 成功状态 (pos 进但 axis 未达) 突然失去 bonus 造成断崖.
         normal = (
             -self._w_pos * pos_err
             - self._w_axis * axis_gate * axis_err
@@ -669,36 +669,6 @@ class DualArmPegHoleEnv(IsaacSim):
         # set_joint_positions 只写 DOF buffer; 不 step 的话 BODY_POS / BODY_ROT
         # view 还是 reset 前的值, reset_all 读到的 EE pose 是 stale.
         self._world.step(render=False)
-
-    def get_obs_scale(self):
-        """32 / 34 / 38 维 fixed-divisor 归一化向量, 与 agent obs 一一对应.
-
-        注: 当前 train_sac 的 ActorNetwork / CriticNetwork 直接用 raw obs,
-        没有把 obs_scale 接进去, 这个函数现在只供后续手动归一化或 wrap
-        使用. 保留是为了文档化每维的合理量级.
-
-        缩放选择 (大致让每维标准差落到 ~1):
-            joint_pos: 半关节范围
-            joint_vel: 2.0 rad/s
-            pos_vec:   0.3m (preinsert 目标距离量级 ~ <0.5m)
-            axis_dot:  1.0  (∈ [-1, +1], 不变)
-            peg_axis / hole_axis: 1.0 (unit vec)
-            axis_resid: 1.0 (peg + hole, 模长 ∈ [0, 2])
-        """
-        device = self._joint_lower.device
-        dtype = torch.float32
-        joint_pos_scale = 0.5 * (self._joint_upper - self._joint_lower).to(dtype)
-        joint_vel_scale = torch.full_like(joint_pos_scale, 2.0)
-        pos_scale = torch.full((3,), 0.3, device=device, dtype=dtype)
-        if self._use_axis_resid_obs:
-            resid_scale = torch.full((3,), 1.0, device=device, dtype=dtype)
-            return torch.cat([joint_pos_scale, joint_vel_scale, pos_scale, resid_scale])
-        axis_scale = torch.full((1,), 1.0, device=device, dtype=dtype)
-        chunks = [joint_pos_scale, joint_vel_scale, pos_scale, axis_scale]
-        if self._use_axis_obs:
-            vec_scale = torch.full((3,), 1.0, device=device, dtype=dtype)
-            chunks.extend([vec_scale, vec_scale])     # peg_axis + hole_axis
-        return torch.cat(chunks)
 
     def _simulation_pre_step(self):
         """每 intermediate step 前注入重力补偿 effort.

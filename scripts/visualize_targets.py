@@ -44,8 +44,8 @@ def parse_args():
                         "[VIS PREINSERT STATS] 里 success_rate 的判定, 不改 marker.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
                    help="success 触发的 axis_err 阈值. **不传 = 默认 inf = pos-only**, "
-                        "此时输出的 success_rate 是 pos-only success 而非 M2 的 "
-                        "pos∧axis success. M2 时传 0.5 / 0.2 与 train 一致.")
+                        "此时输出的 success_rate 是 pos-only success 而非 Stage 2 的 "
+                        "pos∧axis success. Stage 2 train 一致用 0.50, 严格检查可传 0.30 / 0.20.")
     p.add_argument("--preinsert_offset", type=float, default=None,
                    help="覆盖 env 的 preinsert_offset (默认 0.05m)")
     p.add_argument("--duration", type=float, default=0.0,
@@ -322,7 +322,7 @@ def main():
     clr = torch.cat(batch_min_clearance)
     n_total = pos.numel()
     # success_rate 名字 + 阈值显式标出: axis_th=inf 时是 pos-only success, 不是
-    # M2 的 pos∧axis success — 不标清楚容易误读成 M2 的乐观估计.
+    # Stage 2 的 pos∧axis success — 不标清楚容易误读成 Stage 2 的乐观估计.
     is_pos_only = not (mdp._success_axis_threshold < float("inf"))
     success_label = "pos_success_rate" if is_pos_only else "success_rate (pos∧axis)"
     print(

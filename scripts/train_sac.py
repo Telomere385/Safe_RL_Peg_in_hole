@@ -1,30 +1,20 @@
 """SAC 训练 — 双臂 peg-in-hole preinsert (stage flag 化, mushroom-rl + VectorCore).
 
-obs 32 维 (joint_pos+joint_vel+pos_vec+axis_dot), 同一个 env / 同一个 obs / 同一条
-reward 骨架. stage 用 reward 权重 + success_axis_threshold 切换:
+obs 默认 32 维 base (joint_pos+joint_vel+pos_vec+axis_dot); 推荐用
+--use_axis_resid_obs 切到 34 维 (axis_resid 替换 axis_dot, 当前正式 Stage 1/2
+都是 34 维). 同一个 env / 同一条 reward 骨架, stage 用 reward 权重 +
+success_axis_threshold 切换:
 
-    M1' = pos-only           --rew_axis 0.0  --success_axis_threshold inf
-    M2  = pos + axis 对齐    --rew_axis 1.0  --success_axis_threshold 0.2
+    Stage 1 = pos-only         --rew_axis 0.0  --success_axis_threshold inf
+    Stage 2 = pos + axis 对齐  --rew_axis 0.5  --success_axis_threshold 0.50
+                              --axis_gate_radius 0.40 --rew_pos_success 1.0
 
-M2 用 --load_agent path/to/M1p_checkpoint.msh 续训, 不用 cold start.
-**强烈建议 M2 加 --actor_only_warmstart**: 只继承 M1' actor 权重, critic/alpha 冷启动.
-旧 critic 是按旧 M1' reward 学的, 用到 M2 reward 上 Q 语义已经错了, 会把 actor 从
-M1' 学到的 manifold 拽走. 全量 warm-start 留作"reward 没大改"时用.
-(若直接到 0.2 太难, 可以先 warmup 短跑 0.5 当 debug, 但不作为正式 stage.)
+Stage 2 用 --load_agent path/to/Stage1_checkpoint.msh + --actor_only_warmstart
+续训: 只继承 Stage 1 actor 权重, critic/alpha/replay 冷启动. 旧 critic 按旧
+reward 学, 用到 Stage 2 reward 上 Q 语义已错, 会把 actor 拽离 Stage 1 manifold.
+另外 --critic_warmup_transitions 50000 让冷 critic 先单独学 ~40 epoch.
 
-运行:
-    conda activate safe_rl
-    # M1': 建立 32 维 baseline (相当于 pos-only)
-    python scripts/train_sac.py --no_wandb \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
-        --rew_home 0.0005
-
-    # M2: 从 M1' warm-start, 加 axis reward, 直接收到 0.2
-    python scripts/train_sac.py --no_wandb \\
-        --load_agent results/best_agent_M1p_32dim_pos10cm.msh \\
-        --preinsert_success_pos_threshold 0.10 --terminal_hold_bonus 50 \\
-        --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2
+正式训练命令见 README.md "Stage 1 训练命令" / "Stage 2 训练命令" 段.
 
 注意: num_envs=1 触发 IsaacSim cloner 的 `*` pattern 失败 → 至少 2.
 """
@@ -46,6 +36,7 @@ from networks import ActorNetwork, CriticNetwork
 from scripts._eval_utils import (
     compute_hold_metrics,
     deterministic_policy,
+    parse_home_weights,
     resolve_eval_episode_count,
 )
 
@@ -84,7 +75,7 @@ def parse_args():
                         "等价无 critic-only warmup. **actor-only warmstart 推荐设大** "
                         "(e.g. 50000 ≈ 40 epoch), 让冷启动的 critic 先用 warm-start "
                         "actor 收集的 trajectories 单独把 Q 学到合理量级, 再放开 actor, "
-                        "避免随机 critic 把转移过来的 actor 推离 M1' manifold. "
+                        "避免随机 critic 把转移过来的 actor 推离 Stage 1 manifold. "
                         "必须 >= INITIAL_REPLAY_SIZE.")
     p.add_argument("--n_eval_episodes", type=int, default=None,
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
@@ -92,44 +83,48 @@ def parse_args():
                    help="覆盖 env 的 reset 关节噪声")
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None,
                    help="覆盖 env 的 preinsert 位置成功阈值 (env 默认 0.10m, 即当前 "
-                        "M1'/M2 curriculum). 如果显式想跑老 5cm, 传 0.05.")
+                        "Stage 1/Stage 2 curriculum). 如果显式想跑老 5cm, 传 0.05.")
     p.add_argument("--preinsert_offset", type=float, default=None,
                    help="覆盖 env 的 preinsert offset (默认 0.05m)")
     p.add_argument("--rew_action", type=float, default=None,
                    help="覆盖 env 的动作 L2 惩罚权重")
     p.add_argument("--rew_home", type=float, default=None,
                    help="home regularizer 权重 (joint-range 归一化的 ||q - q_home||²). "
-                        "默认 0 关闭. 当前 M1'/M2 建议 0.0005 当极弱 tie-breaker.")
+                        "默认 0 关闭. 当前 Stage 1/Stage 2 建议 0.0005 当极弱 tie-breaker.")
+    p.add_argument("--home_weights", type=parse_home_weights, default=None,
+                   help="home regularizer 的逐关节权重. 接受 7 维单臂权重(自动复制到左右臂)"
+                        "或 14 维完整权重, 逗号/空格分隔. 默认全 1. 例如: "
+                        "'1,1,1,1,0.5,0.25,0.25'.")
     p.add_argument("--rew_success", type=float, default=None,
                    help="覆盖 env 的 per-step full_success (pos∧axis) bonus (默认 2.0)")
     p.add_argument("--rew_pos_success", type=float, default=None,
-                   help="pos-only success bonus (env 默认 0.0). M2 推荐 1.0 ~ 2.0: "
-                        "维持 M1' 已学的'进 pos 阈值给 bonus'信号, 避免 M2 把 axis 加上后"
-                        "M1' 成功状态突然失去 bonus 造成 reward 断崖.")
+                   help="pos-only success bonus (env 默认 0.0). Stage 2 当前正式值 1.0: "
+                        "维持 Stage 1 已学的'进 pos 阈值给 bonus'信号, 避免 Stage 2 把 axis 加上后"
+                        "Stage 1 成功状态突然失去 bonus 造成 reward 断崖.")
     p.add_argument("--axis_gate_radius", type=float, default=None,
                    help="axis 惩罚的距离门控半径 (m). env 默认 inf = 不门控. "
-                        "M2 推荐 0.40: pos_err >= 0.40m 时 axis 项=0, 在 "
+                        "Stage 2 推荐 0.40: pos_err >= 0.40m 时 axis 项=0, 在 "
                         "[pos_th, 0.40m] 区间线性 ramp, 进 pos_th 后 gate 满.")
     p.add_argument("--rew_axis", type=float, default=None,
-                   help="覆盖 env 的 axis_err 权重 (默认 0.0 = M1' pos-only). "
-                        "M2 设 1.0 启用轴对齐惩罚.")
+                   help="覆盖 env 的 axis_err 权重 (默认 0.0 = Stage 1 pos-only). "
+                        "Stage 2 当前正式值 0.5 启用轴对齐惩罚.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
-                   help="覆盖 env 的 axis_err success 阈值 (默认 inf = M1' 不检查 axis). "
-                        "M2 用 0.2. 接受 'inf' 字符串.")
+                   help="覆盖 env 的 axis_err success 阈值 (默认 inf = Stage 1 不检查 axis). "
+                        "Stage 2 训练阈值 0.50, 严格 eval 用 0.20/0.30. 接受 'inf' 字符串.")
     p.add_argument("--load_agent", type=str, default=None,
                    help="warm-start 路径: 从该 checkpoint 加载 agent (actor/critic/"
-                        "optimizer state). obs 维度必须匹配; 31 维 M1 老 checkpoint "
-                        "不能加载到 32 维 env, 先重训 M1'.")
+                        "optimizer state). obs 维度必须与 checkpoint 匹配 — 32 维 base "
+                        "和 34 维 axis_resid 之间不能 warm-start.")
     p.add_argument("--keep_replay", action="store_true",
                    help="warm-start 时保留旧 replay buffer. 默认会清空 — 因为 stage "
-                        "切换 (M1'→M2) reward 函数变了, 旧 transitions 的 "
+                        "切换 (Stage 1→Stage 2) reward 函数变了, 旧 transitions 的 "
                         "reward 标签按旧 reward 算, 留着会拖 critic.")
     p.add_argument("--actor_only_warmstart", action="store_true",
                    help="warm-start 时只继承 actor (mu/sigma 网络) 权重, critic / "
                         "alpha / optimizers / replay buffer 全部冷启动. stage 切换"
-                        "(M1'→M2 reward shape 变化) 时强烈建议打开 — 否则旧 critic "
-                        "按旧 reward 学的 Q 语义会拖坏 actor (M2 一上来 actor 就被拽离 "
-                        "M1' learned manifold). 此 flag 打开时 --keep_replay 自动失效.")
+                        "(Stage 1→Stage 2 reward shape 变化) 时强烈建议打开 — 否则旧 critic "
+                        "按旧 reward 学的 Q 语义会拖坏 actor (Stage 2 一上来 actor 就被拽离 "
+                        "Stage 1 learned manifold). 此 flag 打开时 --keep_replay 自动失效.")
     p.add_argument("--terminal_hold_bonus", type=float, default=None,
                    help="hold-N 步成功后的终结 bonus + episode 终止. "
                         "0 = 关闭 (baseline). >0 启用 absorbing termination.")
@@ -143,17 +138,13 @@ def parse_args():
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.03m).")
-    p.add_argument("--use_axis_obs", action="store_true",
-                   help="agent obs 32 → 38 维: 末尾追加 peg_axis[3] + hole_axis[3] "
-                        "(world frame unit vectors). 历史诊断, 已被 --use_axis_resid_obs 取代.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="agent obs 32 → 34 维: axis_dot[1] 替换成 axis_resid[3] = "
                         "peg_axis + hole_axis (world frame). 模长 ∈ [0, 2], "
                         "0 = 完美反对齐 (preinsert), 2 = 同向 (home pose). "
                         "全程光滑无奇异, 且 axis_err = ||resid||²/2 = 1+dot 与 reward 同语义, "
                         "success_axis_threshold 仍然用旧的 1+dot 量纲 (0.2 ≈ ±37° 锥). "
-                        "**注意**: 与 use_axis_obs 互斥; obs 维度变, 32/38 维 checkpoint 不能"
-                        "warm-start.")
+                        "**注意**: obs 维度变, 32 维 checkpoint 不能 warm-start 到 34 维.")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -205,15 +196,13 @@ def main():
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_action", "rew_success", "rew_pos_success",
-                "rew_axis", "rew_home", "axis_gate_radius",
+                "rew_axis", "rew_home", "home_weights", "axis_gate_radius",
                 "success_axis_threshold", "terminal_hold_bonus",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
     # bool flags: 直接读 args, 不能用 None 哨兵 (action="store_true" 默认 False)
-    if args.use_axis_obs:
-        env_kwargs["use_axis_obs"] = True
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
@@ -261,7 +250,7 @@ def main():
         old_agent = Agent.load(str(load_path))
 
         if args.actor_only_warmstart:
-            # Cold-create 一个新 SAC (匹配当前 M2 reward / env), 然后只把旧 actor
+            # Cold-create 一个新 SAC (匹配当前 Stage 2 reward / env), 然后只把旧 actor
             # (mu / sigma 网络) 的权重拷过来. critic / alpha / optimizers / replay
             # 全部新, 避免旧 critic 用过时 Q 语义拽 actor.
             agent = _cold_create_sac()
@@ -271,14 +260,14 @@ def main():
             agent.policy._sigma_approximator.set_weights(
                 old_agent.policy._sigma_approximator.get_weights()
             )
-            print(f"[WARM-START actor-only] 仅继承 M1' actor 权重 from {load_path}; "
+            print(f"[WARM-START actor-only] 仅继承 Stage 1 actor 权重 from {load_path}; "
                   "critic / alpha / replay 全部冷启动.")
             if args.keep_replay:
                 print("[WARM-START actor-only] --keep_replay 已忽略 (replay 强制冷启).")
             del old_agent  # 释放旧 agent 引用
         else:
             # 全量 warm-start: 继承 actor + critic + optimizer + alpha (+ optionally replay).
-            # obs 维度必须匹配 (32 维); 加载 31 维老 checkpoint 会在 forward 时抛 shape 错.
+            # obs 维度必须与 checkpoint 完全一致, 否则 forward 抛 shape 错.
             agent = old_agent
             print(f"[WARM-START full] 整体加载 agent from {load_path}")
             if not args.keep_replay:
@@ -315,12 +304,7 @@ def main():
         f"清理旧 checkpoint (本次 run 自建): {best_J_path.name}, "
         f"{best_hold_path.name}, {final_path.name}"
     )
-    if mdp._use_axis_resid_obs:
-        obs_mode = "axis_resid"
-    elif mdp._use_axis_obs:
-        obs_mode = "+axis_vec"
-    else:
-        obs_mode = "base"
+    obs_mode = "axis_resid" if mdp._use_axis_resid_obs else "base"
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
@@ -332,6 +316,11 @@ def main():
                 f"axis_gate_radius={mdp._axis_gate_radius:.3f}m  "
                 f"w_home={mdp._w_home:.4f}  "
                 f"preinsert_offset={mdp._preinsert_offset:.3f}m")
+    if mdp._w_home > 0:
+        logger.info(
+            "home_weights="
+            + ",".join(f"{float(w):.3g}" for w in mdp._home_weights.detach().cpu())
+        )
     if args.load_agent is not None:
         logger.info(f"warm-start: {args.load_agent}")
     logger.info(f"target_entropy={target_entropy:.3f}  "
@@ -381,7 +370,7 @@ def main():
     empty_dataset = Dataset.generate(mdp.info, agent.info, n_steps=1, n_envs=args.num_envs)
 
     # Epoch-0 eval: warm-start actor 在 *任何训练之前* 的表现. 用来确认 actor
-    # 权重转移真的生效 (actor-only warmstart 后 pos_err 应该接近 M1' 收敛水平).
+    # 权重转移真的生效 (actor-only warmstart 后 pos_err 应该接近 Stage 1 收敛水平).
     # 如果这里 pos_success_rate 已经接近 0, 后面再讨论训练失败就没意义了 —
     # actor 转移本身就没成功.
     if args.load_agent is not None:

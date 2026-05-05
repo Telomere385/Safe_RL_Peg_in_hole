@@ -5,30 +5,13 @@ eval_sac.py 是数值验证, 这个脚本是肉眼验证. mushroom 的 VectorCor
 preinsert"那一帧. 这里通过 monkey-patch is_absorbing, 让 env 在指定 env
 计数器达到 hold-N 时调 _world.render() 反复刷, 不调 _world.step(), 物理就冻住了.
 
-stage 注意 (M1'/M2): 冻结由 env 的 success counter 触发, 而 success_mask =
-(pos<pos_th) ∧ (axis_err<axis_th). M2 评估时**必须**传 --rew_axis 和
---success_axis_threshold 与训练时一致, 否则 axis_th=inf 会让 freeze 在"位置
-进阈但姿态没达标"时误触发, 看到的不是 M2 真正的成功状态.
+stage 注意: 冻结由 env 的 success counter 触发, 而 success_mask =
+(pos<pos_th) ∧ (axis_err<axis_th). Stage 2 视觉验证时**必须**传 --rew_axis 和
+--success_axis_threshold 与训练时一致 (Stage 2 推荐 0.50 或 0.30), 否则
+axis_th=inf 会让 freeze 在"位置进阈但姿态没达标"时误触发, 看到的不是 Stage 2
+真正的成功状态.
 
-用法:
-    conda activate safe_rl
-    # M1' 视觉验证
-    python scripts/visualize_policy.py \\
-        --agent_path results/best_agent_M1p_32dim_pos10cm.msh \\
-        --preinsert_success_pos_threshold 0.10 \\
-        --rew_home 0.0005
-
-    # M2 视觉验证 (训练时 --rew_axis 1.0 --success_axis_threshold 0.2 + axis-gate)
-    python scripts/visualize_policy.py \\
-        --agent_path results/best_agent_M2_axis02.msh \\
-        --preinsert_success_pos_threshold 0.10 \\
-        --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2 \\
-        --rew_pos_success 1.0 --axis_gate_radius 0.40
-
-    python scripts/visualize_policy.py --freeze_seconds 30
-    python scripts/visualize_policy.py --viz_env_idx 1
-    python scripts/visualize_policy.py --hold_steps 30
+正式 Stage 1 / Stage 2 可视化命令见 README.md "可视化命令" 段.
 
 注意:
 - 必须 num_envs >= 2 (cloner bug).
@@ -45,7 +28,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._eval_utils import deterministic_policy
+from scripts._eval_utils import deterministic_policy, parse_home_weights
 
 
 def parse_args():
@@ -56,10 +39,10 @@ def parse_args():
                    help="至少 2 (num_envs=1 触发 cloner bug)")
     p.add_argument("--viz_env_idx", type=int, default=0)
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=0.10,
-                   help="跟 train 一致 (env/train/eval 默认 0.10m, M1'/M2 curriculum). "
+                   help="跟 train 一致 (env/train/eval 默认 0.10m, Stage 1/Stage 2 curriculum). "
                         "传更紧的值会让 freeze 条件更严, 可能看不到 hold-N 触发.")
     p.add_argument("--initial_joint_noise", type=float, default=0.1,
-                   help="跟 env/train 默认 0.1 一致 (M1' 训练时的 reset 噪声).")
+                   help="跟 env/train 默认 0.1 一致 (Stage 1 训练时的 reset 噪声).")
     p.add_argument("--preinsert_offset", type=float, default=None,
                    help="覆盖 env 的 preinsert offset (默认 0.05m)")
     p.add_argument("--rew_axis", type=float, default=None,
@@ -68,9 +51,12 @@ def parse_args():
     p.add_argument("--rew_home", type=float, default=None,
                    help="覆盖 env 的 home regularizer 权重. visualize 不依赖 reward, "
                         "但保留与 train/eval CLI 一致性.")
+    p.add_argument("--home_weights", type=parse_home_weights, default=None,
+                   help="home regularizer 的逐关节权重. visualize 不依赖 reward, "
+                        "但建议与 train/eval CLI 保持一致.")
     p.add_argument("--success_axis_threshold", type=float, default=None,
-                   help="**必须与 train 一致**. M2 用 0.2. 不传 = "
-                        "默认 inf = M1' 行为, 会让 freeze 在 axis 还没对齐时误触发.")
+                   help="**必须与 train 一致**. Stage 2 训练用 0.50, 严格视觉验证可用 0.30. 不传 = "
+                        "默认 inf = Stage 1 行为, 会让 freeze 在 axis 还没对齐时误触发.")
     p.add_argument("--hold_steps", type=int, default=10,
                    help="连续 N 步在阈内即冻结. 默认 10 = 跟 train 的 hold_success_steps 一致")
     p.add_argument("--n_episodes", type=int, default=2,
@@ -90,8 +76,6 @@ def parse_args():
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
-    p.add_argument("--use_axis_obs", action="store_true",
-                   help="38 维 obs (peg_axis + hole_axis 进 obs). 应与 train 一致.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). 应与 train 一致.")
     return p.parse_args()
@@ -120,6 +104,8 @@ def main():
         env_kwargs["rew_axis"] = args.rew_axis
     if args.rew_home is not None:
         env_kwargs["rew_home"] = args.rew_home
+    if args.home_weights is not None:
+        env_kwargs["home_weights"] = args.home_weights
     if args.success_axis_threshold is not None:
         env_kwargs["success_axis_threshold"] = args.success_axis_threshold
     for key in ("rew_pos_success", "axis_gate_radius",
@@ -127,8 +113,6 @@ def main():
         value = getattr(args, key)
         if value is not None:
             env_kwargs[key] = value
-    if args.use_axis_obs:
-        env_kwargs["use_axis_obs"] = True
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
     mdp = DualArmPegHoleEnv(**env_kwargs)
@@ -136,6 +120,7 @@ def main():
           f"axis_th={mdp._success_axis_threshold:.3f}  "
           f"w_axis={mdp._w_axis:.3f}  "
           f"w_pos_success={mdp._w_pos_success:.3f}  "
+          f"w_home={mdp._w_home:.4f}  "
           f"axis_gate_radius={mdp._axis_gate_radius:.3f}m")
 
     from mushroom_rl.core import Agent, VectorCore
