@@ -1,25 +1,25 @@
 train_script: scripts/train_sac.py
 
 # M2 / Step 2: position + final axis alignment.
-# This is the 32-dim warm-start path from M1'. Do not enable
-# use_axis_resid_obs here: it changes obs_dim to 34 and cannot load
-# the 32-dim M1' checkpoint.
+# Warm-start from M1' (34-dim, use_axis_resid_obs=True) actor-only.
+# obs_dim must stay 34 to match the Phase 1 checkpoint.
 
 # Basic SAC/vectorized rollout parameters.
 num_envs: 16
 render: false
 seed: 42
+use_axis_resid_obs: true
 n_epochs: 200
 n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
 # Network/entropy parameters.
-lr_actor: 3e-4
+lr_actor: 1e-4
 lr_critic: 3e-4
 lr_alpha: 3e-4
 alpha_max: 0.1
-target_entropy: null
+target_entropy: -7
 n_eval_episodes: 16
 critic_warmup_transitions: 50000
 
@@ -28,21 +28,24 @@ initial_joint_noise: null
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null
 rew_action: null
-rew_success: null
+rew_success: 2.0
 rew_home: 0.0005
-rew_axis: 1.0
-success_axis_threshold: 0.2
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+rew_axis: 0.5
+success_axis_threshold: 0.50
 rew_pos_success: 1.0
 axis_gate_radius: 0.40
 terminal_hold_bonus: 50.0
 hold_success_steps: 10
 
-# Warm-start controls. This path must exist on the cluster before M2 starts.
-load_agent: results/best_agent_M1p_32dim_pos10cm.msh
+# Warm-start controls.
+# Copy Phase 1 best_hold.msh to this path before launching:
+#   cp results/best_hold.msh results/phase1_m1p_34dim_pos10cm_200epochs_best_hold.msh
+load_agent: results/phase1_m1p_34dim_pos10cm_200epochs_best_hold.msh
 actor_only_warmstart: true
 keep_replay: false
 
 # Logging.
 wandb_project: bimanual_peghole
-wandb_run_name: phase2_m2_axis02_actoronly_200epochs
+wandb_run_name: phase2_m2_axis05_gate040_cwarm50k_actoronly_200epochs
 no_wandb: false

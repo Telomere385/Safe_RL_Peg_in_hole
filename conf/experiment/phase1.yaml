@@ -1,6 +1,6 @@
 train_script: scripts/train_sac.py
 
-# M1' / Step 1: 32-dim pos-only baseline.
+# M1' / Step 1: 34-dim pos-only baseline (use_axis_resid_obs=True).
 # Axis reward is disabled and success ignores axis, so success is
 # pos_err < preinsert_success_pos_threshold.
 num_envs: 16
@@ -32,6 +32,6 @@ hold_success_steps: 10
 wandb_project: bimanual_peghole
 wandb_run_name: phase1_m1p_34dim_pos10cm_200epochs-a100
 no_wandb: false
-checkpoint_name: phase1_m1p_32dim_pos10cm_200epochs
+checkpoint_name: phase1_m1p_34dim_pos10cm_200epochs
 
 extra_args: []
