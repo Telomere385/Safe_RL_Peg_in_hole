@@ -11,10 +11,13 @@ agent_path: results/best_agent_M2_axis02.msh
 
 # --- env (必须与 phase2 训练时一致) ---
 num_envs: 2
+use_axis_resid_obs: true
 preinsert_success_pos_threshold: 0.10
+rew_success: 2.0
 rew_home: 0.0005
-rew_axis: 1.0
-success_axis_threshold: 0.2
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+rew_axis: 0.5
+success_axis_threshold: 0.50
 rew_pos_success: 1.0
 axis_gate_radius: 0.40
 # terminal_hold_bonus 不传: 脚本内部强制为 0, 确保 episode 不在成功瞬间截断.

@@ -12,11 +12,11 @@ n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
-lr_actor: 3e-4
+lr_actor: 3e-4 
 lr_critic: 3e-4
 lr_alpha: 3e-4
-alpha_max: 0.1
-target_entropy: null
+alpha_max: 0.1 
+target_entropy: null 
 n_eval_episodes: 16
 
 initial_joint_noise: null
@@ -30,8 +30,6 @@ terminal_hold_bonus: 50.0
 hold_success_steps: 10
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase1_m1p_34dim_pos10cm_200epochs-a100
+wandb_run_name: SAC_phase1_5_6_30epochs
 no_wandb: false
-checkpoint_name: phase1_m1p_34dim_pos10cm_200epochs
-
 extra_args: []

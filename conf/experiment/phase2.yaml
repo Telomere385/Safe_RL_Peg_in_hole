@@ -41,7 +41,7 @@ hold_success_steps: 10
 # Warm-start controls.
 # Copy Phase 1 best_hold.msh to this path before launching:
 #   cp results/best_hold.msh results/phase1_m1p_34dim_pos10cm_200epochs_best_hold.msh
-load_agent: results/phase1_m1p_34dim_pos10cm_200epochs_best_hold.msh
+load_agent: results/S1_axisresid_home_uniform_repro_best_hold.msh
 actor_only_warmstart: true
 keep_replay: false
 

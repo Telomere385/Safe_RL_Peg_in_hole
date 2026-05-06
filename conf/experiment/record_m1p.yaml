@@ -11,6 +11,7 @@ agent_path: results/best_agent.msh
 
 # --- env (必须与 phase1 训练时一致) ---
 num_envs: 2              # cloner bug 要求 >= 2; 录制只用 viz_env_idx=0
+use_axis_resid_obs: true
 preinsert_success_pos_threshold: 0.10
 rew_home: 0.0005
 # terminal_hold_bonus 不传: 脚本内部强制为 0, 确保 episode 不在成功瞬间截断.

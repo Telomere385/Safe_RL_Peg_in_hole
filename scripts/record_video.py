@@ -17,15 +17,18 @@
     python scripts/record_video.py \\
         --agent_path results/best_agent.msh \\
         --n_episodes 2 --output_dir results/videos \\
+        --use_axis_resid_obs \\
         --preinsert_success_pos_threshold 0.10 --rew_home 0.0005
 
     # M2
     python scripts/record_video.py \\
         --agent_path results/best_agent_M2.msh \\
         --n_episodes 4 --output_dir results/videos \\
+        --use_axis_resid_obs \\
         --preinsert_success_pos_threshold 0.10 --rew_home 0.0005 \\
-        --rew_axis 1.0 --success_axis_threshold 0.2 \\
-        --rew_pos_success 1.0 --axis_gate_radius 0.40
+        --home_weights 1,1,1,1,0.75,0.5,0.5 \\
+        --rew_axis 0.5 --success_axis_threshold 0.50 \\
+        --rew_success 2.0 --rew_pos_success 1.0 --axis_gate_radius 0.40
 
 注意:
   - num_envs 默认 2 (cloner bug 要求 >= 2), 只录 --viz_env_idx 指定的那个 env.
@@ -45,7 +48,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._eval_utils import deterministic_policy
+from scripts._eval_utils import deterministic_policy, parse_home_weights
 
 
 def parse_args():
@@ -59,9 +62,12 @@ def parse_args():
     p.add_argument("--initial_joint_noise", type=float, default=None)
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None)
     p.add_argument("--preinsert_offset", type=float, default=None)
+    p.add_argument("--rew_action", type=float, default=None)
     p.add_argument("--rew_axis", type=float, default=None)
+    p.add_argument("--rew_success", type=float, default=None)
     p.add_argument("--rew_pos_success", type=float, default=None)
     p.add_argument("--rew_home", type=float, default=None)
+    p.add_argument("--home_weights", type=parse_home_weights, default=None)
     p.add_argument("--axis_gate_radius", type=float, default=None)
     p.add_argument("--success_axis_threshold", type=float, default=None)
     p.add_argument("--terminal_hold_bonus", type=float, default=None,
@@ -70,7 +76,6 @@ def parse_args():
     p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
-    p.add_argument("--use_axis_obs", action="store_true")
     p.add_argument("--use_axis_resid_obs", action="store_true")
     p.add_argument("--stochastic", action="store_true",
                    help="SAC 采样策略; 默认 deterministic tanh(mu)")
@@ -176,14 +181,13 @@ def main():
         terminal_hold_bonus=0.0,  # 强制为 0: 不在成功瞬间截断 episode
     )
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_axis", "rew_pos_success", "rew_home",
+                "preinsert_offset", "rew_action", "rew_axis", "rew_success",
+                "rew_pos_success", "rew_home", "home_weights",
                 "axis_gate_radius", "success_axis_threshold",
                 "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
         val = getattr(args, key)
         if val is not None:
             env_kwargs[key] = val
-    if args.use_axis_obs:
-        env_kwargs["use_axis_obs"] = True
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
 
@@ -236,6 +240,7 @@ def main():
 
     ep_idx = 0
     step_count = 0
+    episode_steps = torch.zeros(args.num_envs, dtype=torch.long, device=mdp._device)
     writer = None
     prefix = f"{args.tag}_" if args.tag else ""
 
@@ -253,14 +258,17 @@ def main():
             # ---- physics step ----
             next_obs, reward, absorbing, _info = mdp.step_all(env_mask, action)
             step_count += 1
+            episode_steps[env_mask] += 1
+            last = absorbing | (episode_steps >= mdp.info.horizon)
 
-            # ---- 非录制 env 提前 absorb 时立即 reset ----
-            other_absorbing = absorbing.clone()
-            other_absorbing[args.viz_env_idx] = False
-            if other_absorbing.any():
-                reset_obs, _ = mdp.reset_all(other_absorbing)
+            # ---- 非录制 env 按 VectorCore 语义 last=absorbing|horizon reset ----
+            other_last = last.clone()
+            other_last[args.viz_env_idx] = False
+            if other_last.any():
+                reset_obs, _ = mdp.reset_all(other_last)
                 next_obs = next_obs.clone()
-                next_obs[other_absorbing] = reset_obs[other_absorbing]
+                next_obs[other_last] = reset_obs[other_last]
+                episode_steps[other_last] = 0
 
             # ---- 独立相机渲染 & 抓帧 ----
             frame = _get_frame(rec_annot, args.width, args.height)
@@ -276,7 +284,7 @@ def main():
             ep_frames += 1
 
             # ---- viz env 的 episode 结束 ----
-            if absorbing[args.viz_env_idx].item():
+            if last[args.viz_env_idx].item():
                 writer.release()
                 writer = None
                 print(f"[REC]   episode {ep_idx:03d} done: {ep_frames} frames  "
@@ -285,6 +293,7 @@ def main():
 
                 if ep_idx < args.n_episodes:
                     obs, _ = mdp.reset_all(env_mask)
+                    episode_steps.zero_()
                     continue
 
             obs = next_obs
