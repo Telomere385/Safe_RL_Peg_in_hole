@@ -79,6 +79,39 @@ Stage 2 当前结论:
 | `S2..._best_hold` | 0.30 | 0.000 | 0.753 | 0.1240m | 0.7154 |
 | `S2..._final` | 0.50 | 0.102 | 0.264 | 0.5331m | 0.9321 |
 
+2026-05-06 上传前又用 README 中的 Stage 2 命令从
+`results/S1_axisresid_home_uniform_repro_best_hold.msh` 重新跑了一次复现实验，
+wandb run:
+
+```text
+https://wandb.ai/miaoxu010522-lund/bimanual_peghole/runs/u1qd4wzl
+```
+
+该 run 的启动配置与上面的 Stage 2 命令一致: actor-only warm-start、
+`critic_warmup_transitions=50000`、`axis_gate_radius=0.40`、`rew_axis=0.5`、
+`success_axis_threshold=0.50`、`target_entropy=-7`、`alpha_max=0.1`。
+epoch 0 的 warm-start actor 尚未 fit 前表现为 `pos_success_rate=0.204`、
+`pos_err_mean=0.4043m`、`axis_err_mean=1.4906`，符合 Stage 1 actor 只保留
+位置能力、还没有学 Stage 2 轴对齐的预期。
+
+训练过程中策略先在 epoch 97 达到稳定 hold: `hold_success_rate=1.0`、
+`max_hold_mean=10.0`、`best_score=10.0`。之后 best-J checkpoint 在 epoch 114
+更新到 `best_J=48.0288`，当时 eval 为 `hold_success_rate=1.0`、
+`final_in_thresh_rate=1.0`、`pos_success_rate=0.780`、`pos_err_mean=0.1666m`、
+`axis_err_mean=0.9114`。wandb summary 记录的最终最佳值为:
+
+```text
+best_J=48.02877
+best_hold_rate=1.0
+best_hold_max_hold_mean=10.0
+best_score=10.0
+```
+
+最终 epoch 200 的策略明显退化: `J=-9.3437`、`R=-40.3688`、
+`hold_success_rate=0.125`、`pos_success_rate=0.269`、`pos_err_mean=0.4862m`。
+因此本次复现实验再次确认: Stage 2 应使用 `best_agent.msh` / `best_hold.msh`
+或复制出的 run-named checkpoint，不应使用 `final_agent.msh` 继续 warm-start。
+
 ## 几何和观测
 
 预插入目标:
