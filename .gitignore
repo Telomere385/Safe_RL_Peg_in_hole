@@ -1,21 +1,10 @@
 # Training outputs
+results/
 logs/
 runs/
 wandb/
+hydra_output/
 
-# Ignore generated result artifacts by default, but keep model checkpoints
-# trackable so trained policies can be committed.
-results/*
-!results/
-!results/**/
-!results/**/*.msh
-!results/**/*.pt
-!results/**/*.pth
-!results/**/*.pkl
-results/wandb/
-results/wandb/**
-results/SAC/
-results/SAC/**
 
 # Python
 __pycache__/
@@ -25,6 +14,11 @@ __pycache__/
 .eggs/
 dist/
 build/
+
+# Model weights / checkpoints
+*.pt
+*.pkl
+*.pth
 
 # Large asset files (store separately or use Git LFS)
 *.usd

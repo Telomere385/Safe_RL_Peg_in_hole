@@ -1,0 +1,21 @@
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+timeout_min: 360
+cpus_per_task: 8
+tasks_per_node: 1
+mem_gb: 48
+nodes: 1
+name: ${hydra.job.name}
+stderr_to_stdout: true
+signal_delay_s: 120     # 在超时前 120 秒向 job 发信号
+max_num_timeout: 3      # job 因 timeout 被自动重提的最大次数。
+array_parallelism: 8    # Hydra multirun/sweep 生成 job array 时，最多同时跑 8 个 array task。
+partition: gpua40
+gpus_per_node: 1
+account: null           # 不指定 Slurm account
+qos: null
+comment: null           # 不添加 Slurm job comment。
+exclude: null           # 不排除任何节点
+gres: null              # 不额外指定 generic resources, 避免和 gpus_per_node 重复。
+setup: null             # 不额外执行 setup 脚本。集群可能要求在 setup 中加载特定模块或设置环境变量。
+additional_parameters: {}

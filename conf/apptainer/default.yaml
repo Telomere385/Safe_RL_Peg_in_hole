@@ -1,0 +1,16 @@
+executable: apptainer
+image: /home/ruiwan/projects/apps/isaac-sim/pkg/isaac-sim.sif
+cleanenv: true
+nv: true
+binds:
+  - /home/ruiwan/projects:/workspace
+  # Isaac Sim 需要向这两个路径写 shader/material cache 和文档目录.
+  # 容器内这些路径只读, 不 bind 会导致 RTX shader DB 初始化失败 →
+  # HydraEngine rtx failed → 渲染全部不可用.
+  - /home/ruiwan/projects/isaac_writable/cache:/isaac-sim/kit/cache
+  - /home/ruiwan/projects/isaac_writable/data:/isaac-sim/kit/data
+shell: bash
+shell_args:
+  - --noprofile
+  - --norc
+  - -c

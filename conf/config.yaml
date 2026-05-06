@@ -1,0 +1,19 @@
+defaults:
+  - experiment@train: phase2
+  - apptainer@apptainer: default
+  - override hydra/launcher: slurm_apptainer
+  - _self_
+
+project:
+  host_project_root: /home/ruiwan/projects/Safe_RL_Peg_in_hole
+  container_project_root: /workspace/Safe_RL_Peg_in_hole
+  isaac_python: /isaac-sim/python.sh
+
+hydra:
+  job:
+    name: train # Hydra job 名称。Slurm 配置里的 ${hydra.job.name} 会解析成 train。
+  run:
+    dir: ${project.host_project_root}/hydra_output/run/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${project.host_project_root}/hydra_output/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

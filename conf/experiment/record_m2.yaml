@@ -1,0 +1,30 @@
+train_script: scripts/record_video.py
+
+# M2 录制配置 — 与 phase2.yaml 训练参数对齐.
+# 用法:
+#   python scripts/train_hydra.py --multirun experiment@train=record_m2
+#   python scripts/train_hydra.py --multirun experiment@train=record_m2 \
+#       train.agent_path=results/my_m2_agent.msh train.n_episodes=8
+
+# --- agent ---
+agent_path: results/best_agent_M2_axis02.msh
+
+# --- env (必须与 phase2 训练时一致) ---
+num_envs: 2
+preinsert_success_pos_threshold: 0.10
+rew_home: 0.0005
+rew_axis: 1.0
+success_axis_threshold: 0.2
+rew_pos_success: 1.0
+axis_gate_radius: 0.40
+# terminal_hold_bonus 不传: 脚本内部强制为 0, 确保 episode 不在成功瞬间截断.
+hold_success_steps: 10
+
+# --- 录制参数 ---
+n_episodes: 4
+viz_env_idx: 0
+output_dir: results/videos
+fps: 30
+width: 1280
+height: 720
+tag: M2

@@ -1,0 +1,48 @@
+train_script: scripts/train_sac.py
+
+# M2 / Step 2: position + final axis alignment.
+# This is the 32-dim warm-start path from M1'. Do not enable
+# use_axis_resid_obs here: it changes obs_dim to 34 and cannot load
+# the 32-dim M1' checkpoint.
+
+# Basic SAC/vectorized rollout parameters.
+num_envs: 16
+render: false
+seed: 42
+n_epochs: 200
+n_steps_per_epoch: 1024
+n_steps_per_fit: null
+utd: null
+
+# Network/entropy parameters.
+lr_actor: 3e-4
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.1
+target_entropy: null
+n_eval_episodes: 16
+critic_warmup_transitions: 50000
+
+# Current DualArmPegHoleEnv preinsert-stage flags.
+initial_joint_noise: null
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+rew_action: null
+rew_success: null
+rew_home: 0.0005
+rew_axis: 1.0
+success_axis_threshold: 0.2
+rew_pos_success: 1.0
+axis_gate_radius: 0.40
+terminal_hold_bonus: 50.0
+hold_success_steps: 10
+
+# Warm-start controls. This path must exist on the cluster before M2 starts.
+load_agent: results/best_agent_M1p_32dim_pos10cm.msh
+actor_only_warmstart: true
+keep_replay: false
+
+# Logging.
+wandb_project: bimanual_peghole
+wandb_run_name: phase2_m2_axis02_actoronly_200epochs
+no_wandb: false
