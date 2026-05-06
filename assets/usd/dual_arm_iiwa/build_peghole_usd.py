@@ -22,12 +22,13 @@ pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
   /bh_robot/right_hande_robotiq_hande_link/Hole/hole_entry
 
 -- 几何与挂载参数 -----------------------------------------------------------
-  PEG:  实心圆柱, radius=0.008, height=0.035, 轴 = local Z.
-  HOLE: 空心圆柱 mesh, outer_r=0.012, inner_r=0.010, height=0.030,
+  PEG:  实心圆柱, radius=0.016, height=0.070, 轴 = local Z.
+  HOLE: 空心圆柱 mesh, outer_r=0.024, inner_r=0.020, height=0.060,
         底封顶开 (方便 peg 从 +Z 插入).
   挂载 (Step 2 新约定): translate = (PART_X, 0, PART_Z), orient = identity.
         结果: peg/hole 的轴 (local Z) 直接对齐 EE 的 +Z 方向 = 夹爪正前方.
-        双臂 ready pose 对面时, 两侧 +Z 在 world 中天然反平行 = 完美对齐.
+        reward 中的理想插入对齐定义为两侧轴在 world 中反平行
+        (axis_dot=-1, axis_err=0).
 
 -- 运行 ---------------------------------------------------------------------
   python assets/usd/dual_arm_iiwa/build_peghole_usd.py

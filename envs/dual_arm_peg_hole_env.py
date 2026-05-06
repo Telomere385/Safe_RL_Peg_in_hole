@@ -148,9 +148,9 @@ _HOLE_ENTRY_LOCAL_Z = 0.5 * _HOLE_HEIGHT   # 0.030
 PEG_TIP_OFFSET_IN_LEFTEE = (_PART_X, 0.0, _PART_Z + _PEG_TIP_LOCAL_Z)
 HOLE_ENTRY_OFFSET_IN_RIGHTEE = (_PART_X, 0.0, _PART_Z + _HOLE_ENTRY_LOCAL_Z)
 
-# peg_axis / hole_axis: 都沿 EE 局部 +Z (夹爪前方). 双臂 ready pose 互相对面时,
-# left_EE +Z 指向右 EE, right_EE +Z 指向左 EE — 两个 world 向量天然反平行,
-# axis_dot = -1 = 完美对齐, 与原约定的 axis_err = 1 + dot 语义一致.
+# peg_axis / hole_axis: 都沿 EE 局部 +Z (夹爪前方). 训练目标要求两者在 world
+# frame 中反平行: axis_dot = -1, axis_err = 1 + dot = 0. 当前 HOME reset 下
+# axis_err 接近 2 是正常的; Stage 2 才负责从同向附近学到反向对齐.
 PEG_AXIS_IN_LEFTEE = (0.0, 0.0, +1.0)
 HOLE_AXIS_IN_RIGHTEE = (0.0, 0.0, +1.0)
 

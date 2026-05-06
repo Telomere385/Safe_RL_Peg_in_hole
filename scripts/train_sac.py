@@ -137,7 +137,7 @@ def parse_args():
     p.add_argument("--proxy_arm_radius", type=float, default=None,
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
-                   help="覆盖 env 的 EE sphere proxy 半径 (默认 0.03m).")
+                   help="覆盖 env 的 EE sphere proxy 半径 (默认 0.04m).")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="agent obs 32 → 34 维: axis_dot[1] 替换成 axis_resid[3] = "
                         "peg_axis + hole_axis (world frame). 模长 ∈ [0, 2], "
