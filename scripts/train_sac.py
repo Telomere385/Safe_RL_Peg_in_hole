@@ -147,6 +147,7 @@ def parse_args():
                         "**注意**: obs 维度变, 32 维 checkpoint 不能 warm-start 到 34 维.")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
     p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--wandb_group", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
     return p.parse_args()
 
@@ -284,26 +285,29 @@ def main():
 
     core = VectorCore(agent, mdp, callbacks_fit=[clamp_alpha])
 
+    from datetime import datetime
     results_dir = PROJECT_ROOT / "results"
     results_dir.mkdir(exist_ok=True)
+    run_ts = datetime.now().strftime("%Y-%m-%d/%H-%M-%S")
+    ckpt_dir = results_dir / "checkpoints" / run_ts
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     # 三种 checkpoint, 各自独立追踪, 互不覆盖:
     #   best_J.msh        - 最高 discounted return J (=best_agent.msh 的别名, 向后兼容)
     #   best_hold.msh     - 最高 hold_success_rate (出现 hold 之后才会写入)
     #   final_agent.msh   - 训练结束时无条件保存最后一个 epoch 的 actor
     # 防止 "终态稳定 hold=1.0 但 J 没破 best_J 上限" 这种情况下 best_agent 锁在
     # 早期低 hold 的快照, 独立 eval 评的不是真实最终策略.
-    best_J_path = results_dir / "best_agent.msh"
-    best_hold_path = results_dir / "best_hold.msh"
-    final_path = results_dir / "final_agent.msh"
-    for p in (best_J_path, best_hold_path, final_path):
-        if p.exists():
-            p.unlink()
+    # ckpt_dir: 按时间归档, 各次运行互不覆盖.
+    # results_dir: 直接保存一份, 方便 eval 脚本直接用.
+    best_J_path = ckpt_dir / "best_agent.msh"
+    best_hold_path = ckpt_dir / "best_hold.msh"
+    final_path = ckpt_dir / "final_agent.msh"
+    best_J_path_flat = results_dir / "best_agent.msh"
+    best_hold_path_flat = results_dir / "best_hold.msh"
+    final_path_flat = results_dir / "final_agent.msh"
     logger = Logger("SAC", results_dir=str(results_dir))
     logger.strong_line()
-    logger.info(
-        f"清理旧 checkpoint (本次 run 自建): {best_J_path.name}, "
-        f"{best_hold_path.name}, {final_path.name}"
-    )
+    logger.info(f"checkpoint 目录: {ckpt_dir}")
     obs_mode = "axis_resid" if mdp._use_axis_resid_obs else "base"
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
@@ -359,6 +363,7 @@ def main():
         import wandb
         wandb_run = wandb.init(
             project=args.wandb_project, name=args.wandb_run_name,
+            group=args.wandb_group,
             config={**vars(args), "algo": "SAC",
                     "target_entropy_resolved": target_entropy,
                     "obs_dim": obs_dim, "act_dim": act_dim,
@@ -454,6 +459,7 @@ def main():
         if improved_J:
             best_J = J
             agent.save(str(best_J_path))
+            agent.save(str(best_J_path_flat))
         score = m['hold_success_rate'] * m['max_hold_mean']
         improved_score = m['hold_success_rate'] > 0 and score > best_score
         if improved_score:
@@ -472,6 +478,7 @@ def main():
             best_hold_rate = hold_rate
             best_hold_score = max_hold
             agent.save(str(best_hold_path))
+            agent.save(str(best_hold_path_flat))
 
         absorb_prev = mdp._absorb_count
         absorb_physx_prev = mdp._absorb_count_physx
@@ -538,6 +545,7 @@ def main():
     # 独立 eval 应当至少评一次它, 跟 best_J / best_hold 对照, 避免 "best_J 锁早期低 hold
     # 快照, 终态 hold=1.0 但因 J 未破上限被永远丢失" 这类 silent failure.
     agent.save(str(final_path))
+    agent.save(str(final_path_flat))
 
     if best_hold_rate < 0:
         best_hold_display = "n/a (no hold success)"
@@ -548,7 +556,8 @@ def main():
         f"best_hold_rate = {best_hold_display}  "
         f"best_score = {best_score:.3f}"
     )
-    logger.info(f"checkpoint 写入: {best_J_path.name} (best J) / "
+    logger.info(f"checkpoint 写入: {ckpt_dir}/ 下的 "
+                f"{best_J_path.name} (best J) / "
                 f"{best_hold_path.name} (best hold) / {final_path.name} (final). "
                 "**eval 时务必对三个都跑一遍**, best_J 不一定 = 最稳策略.")
 

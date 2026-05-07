@@ -1,0 +1,11 @@
+executable: apptainer
+image: /home/ruiwan/projects/apps/isaac-sim/pkg/isaac-sim.sif
+cleanenv: true
+nv: true
+binds:
+  - /home/ruiwan/projects:/workspace
+shell: bash
+shell_args:
+  - --noprofile
+  - --norc
+  - -c

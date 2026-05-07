@@ -5,18 +5,18 @@ train_script: scripts/train_sac.py
 # pos_err < preinsert_success_pos_threshold.
 num_envs: 16
 render: false
-seed: 42
+seed: 4
 use_axis_resid_obs: true
 n_epochs: 100
 n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
-lr_actor: 3e-4 
+lr_actor: 1e-4 #changed
 lr_critic: 3e-4
 lr_alpha: 3e-4
-alpha_max: 0.1 
-target_entropy: null 
+alpha_max: 0.05 #changed
+target_entropy: -7 #changed
 n_eval_episodes: 16
 
 initial_joint_noise: null
@@ -30,6 +30,8 @@ terminal_hold_bonus: 50.0
 hold_success_steps: 10
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase1_old_params
+wandb_run_name: seed_${train.seed}
+wandb_group: phase1_modified_seed_sweep
 no_wandb: false
-extra_args: []
+extra_args:
+  - "--clearance_hard=-inf"

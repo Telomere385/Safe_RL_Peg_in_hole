@@ -1,6 +1,6 @@
 defaults:
   - experiment@train: phase1
-  - apptainer@apptainer: default
+  - apptainer@apptainer: training
   - override hydra/launcher: slurm_apptainer
   - _self_
 

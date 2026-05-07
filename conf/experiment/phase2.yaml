@@ -14,6 +14,7 @@ n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
+
 # Network/entropy parameters.
 lr_actor: 1e-4
 lr_critic: 3e-4
@@ -49,3 +50,5 @@ keep_replay: false
 wandb_project: bimanual_peghole
 wandb_run_name: phase2_m2_axis05_gate040_cwarm50k_actoronly_200epochs
 no_wandb: false
+extra_args:
+  - "--clearance_hard=-inf"
