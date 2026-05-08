@@ -16,7 +16,8 @@ class ActorNetwork(nn.Module):
         self._h2 = nn.Linear(n_features, n_features)
         self._out = nn.Linear(n_features, output_shape[0])
         for l in (self._h1, self._h2, self._out):
-            nn.init.xavier_uniform_(l.weight)
+            nn.init.xavier_uniform_(l.weight, gain=0.1)
+            nn.init.zeros_(l.bias)
 
     def forward(self, x, **_):
         x = x.float()
@@ -32,7 +33,8 @@ class CriticNetwork(nn.Module):
         self._h2 = nn.Linear(n_features, n_features)
         self._out = nn.Linear(n_features, output_shape[0])
         for l in (self._h1, self._h2, self._out):
-            nn.init.xavier_uniform_(l.weight)
+            nn.init.xavier_uniform_(l.weight, gain=0.1)
+            nn.init.zeros_(l.bias)
 
     def forward(self, state, action, **_):
         state = state.float()
