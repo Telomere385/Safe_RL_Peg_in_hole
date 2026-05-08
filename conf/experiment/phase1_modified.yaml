@@ -26,7 +26,10 @@ rew_action: null
 rew_home: 0.0005
 rew_axis: 0.0
 success_axis_threshold: .inf
-terminal_hold_bonus: 50.0
+# hold-N absorbing 关闭 (terminal_hold_bonus=0 即关). episode 只走 horizon, 让
+# -w_pos*pos_err 的连续梯度跑满, 避免 milestone cliff 让精度提前停在阈值边.
+# hold_success_steps 仍保留, 仅作 eval 指标 (compute_hold_metrics 用).
+terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
 wandb_project: bimanual_peghole

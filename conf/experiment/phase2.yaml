@@ -36,7 +36,10 @@ rew_axis: 0.5
 success_axis_threshold: 0.50
 rew_pos_success: 1.0
 axis_gate_radius: 0.40
-terminal_hold_bonus: 50.0
+# hold-N absorbing 关闭 (terminal_hold_bonus=0 即关). episode 只走 horizon, 让
+# -w_pos*pos_err / -w_axis*axis_err 的连续梯度跑满, 避免 milestone cliff 让精度
+# 提前停在阈值边. hold_success_steps 仅作 eval 指标 (compute_hold_metrics 用).
+terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
 # Warm-start controls.
