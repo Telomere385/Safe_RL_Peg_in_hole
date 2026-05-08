@@ -1,19 +1,18 @@
-"""生成 dual_arm_iiwa_with_peghole.usda — 机器人 + 视觉 peg/hole 的 composed 资产.
+"""生成 dual_arm_iiwa_with_peghole.usda — 机器人 + peg/hole 几何的 composed 资产.
 
-Phase 1.5 commit 1: 仅改 assets/. 不改 env / scripts.
-只加 "几何 + 可定位的 peg_tip / hole_entry 参考帧" 到资产层, 为后续 commit 准备.
+最初的 Phase 1.5 版本只加 visual peg/hole 与定位帧。Stage 3 起, 本脚本同时
+生成 peg/hole collision proxy。
 
--- 关键设计: peg/hole 是纯视觉 -----------------------------------------------
+-- 关键设计: peg/hole 是 EE link 的附属几何 -----------------------------------
 本文件通过 USD references 引用原始 ``dual_arm_iiwa.usd`` (robot 0 修改),
-然后用 ``over`` 在左/右 EE link 下挂 Peg / Hole prim. Peg 和 Hole:
+然后用 ``over`` 在左/右 EE link 下挂 Peg / Hole prim. Peg 和 Hole 本身:
   * 没有 RigidBodyAPI  -> 不是动力学刚体, 不进入 articulation 计算
   * 没有 MassAPI        -> 对 G(q) 重力补偿 0 贡献
-  * 没有 CollisionAPI   -> 不进入 CollisionHelper, 不产生接触
-它们只是 EE link 的场景图子节点, 渲染时跟随 EE 位姿变化.
+但 Stage 3 起, 它们会带 invisible collision 子 prim, 作为对应 EE link 的
+附属 collision shapes, 用来产生 peg-hole 真实接触。
 
-这一步**物理上是 no-op**: 新资产加载后, robot 的 DoF 数、质量矩阵、collider
-集合与原 ``dual_arm_iiwa.usd`` 完全相同. 唯一差别是场景里多了两个可查询
-pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
+注意: 这不改变 articulation DoF / 质量矩阵, 但会改变 collider 集合。Stage 3
+环境需要把 peg-hole 正常接触从 "双臂自碰撞 hard absorbing" 中排除。
 
 -- 稳定的 prim 路径 (env 代码在后续 commit 引用) ----------------------------
   /bh_robot/left_hande_robotiq_hande_link/Peg
@@ -25,6 +24,8 @@ pose 的视觉几何体和两个命名帧 (peg_tip / hole_entry).
   PEG:  实心圆柱, radius=0.016, height=0.070, 轴 = local Z.
   HOLE: 空心圆柱 mesh, outer_r=0.024, inner_r=0.020, height=0.060,
         底封顶开 (方便 peg 从 +Z 插入).
+        Collision: peg 用 Cylinder; hole 内壁用多个 invisible Cube 拼环,
+        避免用移动 concave mesh 做碰撞。
   挂载 (Step 2 新约定): translate = (PART_X, 0, PART_Z), orient = identity.
         结果: peg/hole 的轴 (local Z) 直接对齐 EE 的 +Z 方向 = 夹爪正前方.
         reward 中的理想插入对齐定义为两侧轴在 world 中反平行
@@ -66,6 +67,15 @@ HOLE_COLOR = (0.20, 0.75, 0.20)   # green
 
 # hollow cylinder mesh 分段数 --------------------------------------------------
 NUM_SEGMENTS = 48
+
+# PhysX collision proxy -------------------------------------------------------
+# Peg 是简单 cylinder collider; Hole 不直接用 concave Mesh collider, 而是用
+# 盒子拼成内壁环。这样 collision shapes 都是 convex/simple, 对移动 articulation
+# 更稳定。contactOffset 必须小于 peg/hole 径向余量 (4mm), 否则会把有效孔径吃掉。
+HOLE_COLLISION_SEGMENTS = 16
+HOLE_BOTTOM_COLLIDER_HEIGHT = 0.003
+PHYSX_CONTACT_OFFSET = 0.001
+PHYSX_REST_OFFSET = 0.0
 
 HERE = Path(__file__).resolve().parent
 ROBOT_USD_REL = "./dual_arm_iiwa.usd"      # 被引用的原始 robot USD (同目录)
@@ -124,10 +134,90 @@ def _fmt_int_array(arr, per_line: int = 20) -> str:
     return "[" + ",\n                    ".join(lines) + "]"
 
 
+def _fmt_collision_api_attrs(indent: str) -> str:
+    return (
+        f"{indent}float physxCollision:contactOffset = {PHYSX_CONTACT_OFFSET:.6f}\n"
+        f"{indent}float physxCollision:restOffset = {PHYSX_REST_OFFSET:.6f}"
+    )
+
+
+def _peg_collision_usda(indent: str = "            ") -> str:
+    i = indent
+    attrs = _fmt_collision_api_attrs(i + "    ")
+    return f"""\
+{i}def Cylinder "Collision" (
+{i}    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI"]
+{i})
+{i}{{
+{i}    double radius = {PEG_RADIUS:.6f}
+{i}    double height = {PEG_HEIGHT:.6f}
+{i}    uniform token axis = "Z"
+{i}    token visibility = "invisible"
+{attrs}
+{i}}}
+"""
+
+
+def _hole_collision_usda(indent: str = "            ") -> str:
+    i = indent
+    child = i + "    "
+    wall_thickness = HOLE_OUTER_R - HOLE_INNER_R
+    r_mid = 0.5 * (HOLE_OUTER_R + HOLE_INNER_R)
+    tangent_width = (
+        2.0 * r_mid * np.tan(np.pi / HOLE_COLLISION_SEGMENTS) * 1.05
+    )
+    attrs = _fmt_collision_api_attrs(child + "    ")
+    lines = [
+        f'{i}def Xform "Collision"',
+        f"{i}{{",
+    ]
+    for k in range(HOLE_COLLISION_SEGMENTS):
+        theta = 2.0 * np.pi * k / HOLE_COLLISION_SEGMENTS
+        x = r_mid * np.cos(theta)
+        y = r_mid * np.sin(theta)
+        qw = np.cos(0.5 * theta)
+        qz = np.sin(0.5 * theta)
+        lines.extend([
+            f'{child}def Cube "Wall_{k:02d}" (',
+            f'{child}    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI"]',
+            f"{child})",
+            f"{child}{{",
+            f"{child}    double size = 1.0",
+            f"{child}    float3 xformOp:translate = ({x:.6f}, {y:.6f}, 0.000000)",
+            f"{child}    quatf xformOp:orient = ({qw:.8f}, 0.0, 0.0, {qz:.8f})",
+            f"{child}    float3 xformOp:scale = ({wall_thickness:.6f}, {tangent_width:.6f}, {HOLE_HEIGHT:.6f})",
+            f'{child}    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]',
+            f'{child}    token visibility = "invisible"',
+            attrs,
+            f"{child}}}",
+            "",
+        ])
+
+    bottom_z = -0.5 * HOLE_HEIGHT - 0.5 * HOLE_BOTTOM_COLLIDER_HEIGHT
+    lines.extend([
+        f'{child}def Cylinder "Bottom" (',
+        f'{child}    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysxCollisionAPI"]',
+        f"{child})",
+        f"{child}{{",
+        f"{child}    double radius = {HOLE_INNER_R:.6f}",
+        f"{child}    double height = {HOLE_BOTTOM_COLLIDER_HEIGHT:.6f}",
+        f'{child}    uniform token axis = "Z"',
+        f"{child}    float3 xformOp:translate = (0.000000, 0.000000, {bottom_z:.6f})",
+        f'{child}    uniform token[] xformOpOrder = ["xformOp:translate"]',
+        f'{child}    token visibility = "invisible"',
+        attrs,
+        f"{child}}}",
+        f"{i}}}",
+    ])
+    return "\n".join(lines)
+
+
 def build() -> None:
     hole_pts, hole_fvc, hole_fvi = hollow_cylinder_mesh(
         HOLE_OUTER_R, HOLE_INNER_R, HOLE_HEIGHT
     )
+    peg_collision = _peg_collision_usda()
+    hole_collision = _hole_collision_usda()
     peg_tip_z    = 0.5 * PEG_HEIGHT     # tip 在 peg 本地 +Z 面中心
     hole_entry_z = 0.5 * HOLE_HEIGHT    # entry 在 hole 本地 +Z 面 (开口)中心
 
@@ -136,11 +226,13 @@ def build() -> None:
     defaultPrim = "bh_robot"
     upAxis = "Z"
     metersPerUnit = 1.0
-    doc = \"\"\"Composed stage: robot + visual peg (left EE) / hole (right EE).
+    doc = \"\"\"Composed stage: robot + peg/hole visual geometry and collision proxies.
 Generated by build_peghole_usd.py.
 
-Peg 和 Hole 是视觉-only 子节点, 没有 RigidBodyAPI / MassAPI / CollisionAPI,
-不改变 articulation DoF, 质量矩阵 (G(q)), 或 collider 集合.
+Peg 和 Hole 本身没有 RigidBodyAPI / MassAPI, 不改变 articulation DoF 或质量矩阵
+(G(q)). Stage 3 起, 它们带 invisible collision 子 prim: peg = Cylinder,
+hole = {HOLE_COLLISION_SEGMENTS} 个 Cube wall + Bottom stopper, 作为 EE link 的
+附属 collision shapes。
 
 稳定 prim 路径 (env 代码引用):
     /bh_robot/left_hande_robotiq_hande_link/Peg
@@ -151,6 +243,7 @@ Peg 和 Hole 是视觉-only 子节点, 没有 RigidBodyAPI / MassAPI / Collision
 挂载: translate=({PART_X}, 0, {PART_Z}), orient=identity (轴沿 EE +Z = 夹爪前方).
 几何: PEG radius={PEG_RADIUS}, height={PEG_HEIGHT};
       HOLE outer_r={HOLE_OUTER_R}, inner_r={HOLE_INNER_R}, height={HOLE_HEIGHT}.
+碰撞: contactOffset={PHYSX_CONTACT_OFFSET}, restOffset={PHYSX_REST_OFFSET}.
 \"\"\"
 )
 
@@ -174,6 +267,7 @@ def Xform "bh_robot" (
                 color3f[] primvars:displayColor = [({PEG_COLOR[0]}, {PEG_COLOR[1]}, {PEG_COLOR[2]})]
             }}
 
+{peg_collision}
             def Xform "peg_tip"
             {{
                 float3 xformOp:translate = (0.000000, 0.000000, {peg_tip_z:.6f})
@@ -200,6 +294,7 @@ def Xform "bh_robot" (
                 color3f[] primvars:displayColor = [({HOLE_COLOR[0]}, {HOLE_COLOR[1]}, {HOLE_COLOR[2]})]
             }}
 
+{hole_collision}
             def Xform "hole_entry"
             {{
                 float3 xformOp:translate = (0.000000, 0.000000, {hole_entry_z:.6f})

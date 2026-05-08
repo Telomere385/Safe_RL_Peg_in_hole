@@ -76,6 +76,9 @@ def parse_args():
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
+    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
+                   help="Stage 3 可视化用: PhysX self-collision 分组排除 EE link, "
+                        "避免 peg-hole 正常接触被 hard absorbing 截断.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). 应与 train 一致.")
     return p.parse_args()
@@ -115,6 +118,8 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
+    if args.exclude_ee_from_physx_self_collision:
+        env_kwargs["exclude_ee_from_physx_self_collision"] = True
     mdp = DualArmPegHoleEnv(**env_kwargs)
     print(f"[VIZ STAGE] pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
           f"axis_th={mdp._success_axis_threshold:.3f}  "

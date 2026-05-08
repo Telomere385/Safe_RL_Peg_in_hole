@@ -55,14 +55,18 @@ def parse_args():
     p.add_argument("--n_resets", type=int, default=1,
                    help="进入主可视化循环前采样多少次 reset, 用来打印 preinsert "
                         "误差在 reset 分布下的统计. n_resets=1 = 单次 reset.")
-    p.add_argument("--show_spheres", default=True,
+    p.add_argument("--show_spheres", "--show-spheres", dest="show_spheres", default=True,
                    action=argparse.BooleanOptionalAction,
                    help="是否画双臂 sphere proxy (38 个半透明球, 左橙右蓝). "
                         "用来肉眼判断 home pose 下 reset 余量, 默认开. 关用 --no-show-spheres.")
-    p.add_argument("--hold_pose", default=True,
+    p.add_argument("--hold_pose", "--hold-pose", dest="hold_pose", default=True,
                    action=argparse.BooleanOptionalAction,
                    help="主循环每帧 kinematic 重写 joint_pos = HOME, 防止重力下沉. "
                         "默认开. 想看自然 dynamics 用 --no-hold-pose.")
+    p.add_argument("--show_collider_geometry", "--show-collider-geometry",
+                   dest="show_collider_geometry", action="store_true",
+                   help="把 peg/hole collision prim 从 invisible 临时改成可见, "
+                        "用于肉眼确认 Stage 3 collider 是否加载并对齐.")
     return p.parse_args()
 
 
@@ -247,6 +251,79 @@ def _print_preinsert_frames(frames, errors, env_idx):
         print(f"  success     = {bool(errors['success_mask'][env_idx])}")
 
 
+def _print_peghole_collision_prims():
+    """Print loaded peg/hole collision prims from the live USD stage."""
+    try:
+        import omni.usd
+    except Exception as e:
+        print(f"[VIS COLLISION PRIMS] skipped: omni.usd import failed: {e}")
+        return
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        print("[VIS COLLISION PRIMS] skipped: no live USD stage")
+        return
+
+    peg_collision = []
+    hole_walls = []
+    hole_bottom = []
+    for prim in stage.Traverse():
+        path = prim.GetPath().pathString
+        if path.endswith("/Peg/Collision"):
+            peg_collision.append(path)
+        elif "/Hole/Collision/Wall_" in path:
+            hole_walls.append(path)
+        elif path.endswith("/Hole/Collision/Bottom"):
+            hole_bottom.append(path)
+
+    print(
+        "[VIS COLLISION PRIMS] "
+        f"peg_collision={len(peg_collision)}  "
+        f"hole_walls={len(hole_walls)}  "
+        f"hole_bottom={len(hole_bottom)}"
+    )
+    for label, paths in (
+        ("peg", peg_collision[:2]),
+        ("wall", hole_walls[:4]),
+        ("bottom", hole_bottom[:2]),
+    ):
+        for path in paths:
+            print(f"  {label}: {path}")
+
+
+def _show_peghole_collision_geometry():
+    """Make peg/hole collision prims visible for viewport debugging."""
+    try:
+        import omni.usd
+        from pxr import Gf, UsdGeom, Vt
+    except Exception as e:
+        print(f"[VIS COLLISION GEOM] skipped: import failed: {e}")
+        return
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        print("[VIS COLLISION GEOM] skipped: no live USD stage")
+        return
+
+    shown = 0
+    for prim in stage.Traverse():
+        path = prim.GetPath().pathString
+        is_peg = path.endswith("/Peg/Collision")
+        is_wall = "/Hole/Collision/Wall_" in path
+        is_bottom = path.endswith("/Hole/Collision/Bottom")
+        if not (is_peg or is_wall or is_bottom):
+            continue
+
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+        color = Gf.Vec3f(1.0, 0.15, 0.9) if is_peg else Gf.Vec3f(0.1, 0.8, 1.0)
+        gprim = UsdGeom.Gprim(prim)
+        gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([color]))
+        gprim.CreateDisplayOpacityAttr().Set([0.45])
+        shown += 1
+
+    print(f"[VIS COLLISION GEOM] made visible collision prims: {shown}")
+
+
 def _focus_camera_on_env(mdp, env_idx):
     try:
         from isaacsim.core.utils.viewports import set_camera_view
@@ -284,6 +361,9 @@ def main():
 
     mdp = DualArmPegHoleEnv(**env_kwargs)
     _focus_camera_on_env(mdp, args.viz_env_idx)
+    _print_peghole_collision_prims()
+    if args.show_collider_geometry:
+        _show_peghole_collision_geometry()
     mask = torch.ones(args.num_envs, dtype=torch.bool, device=mdp._device)
 
     print(f"[VIS ENV] {env_kwargs}")

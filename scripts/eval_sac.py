@@ -69,6 +69,9 @@ def parse_args():
                    help="覆盖 arm sphere proxy 半径. 应与 train 一致.")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 EE sphere proxy 半径. 应与 train 一致.")
+    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
+                   help="应与 Stage 3 train 一致: PhysX self-collision 分组排除 EE link, "
+                        "避免 peg-hole 正常接触被算作 hard absorbing.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="34 维 obs (axis_resid 替换 axis_dot). **必须与 train 一致**, "
                         "否则 actor 输入维度对不上加载会失败.")
@@ -96,6 +99,8 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
+    if args.exclude_ee_from_physx_self_collision:
+        env_kwargs["exclude_ee_from_physx_self_collision"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     print(f"[EVAL ENV] {env_kwargs}")
 

@@ -76,6 +76,9 @@ def parse_args():
     p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
+    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
+                   help="Stage 3 录制用: PhysX self-collision 分组排除 EE link, "
+                        "避免 peg-hole 正常接触被 hard absorbing 截断.")
     p.add_argument("--use_axis_resid_obs", action="store_true")
     p.add_argument("--stochastic", action="store_true",
                    help="SAC 采样策略; 默认 deterministic tanh(mu)")
@@ -190,6 +193,8 @@ def main():
             env_kwargs[key] = val
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
+    if args.exclude_ee_from_physx_self_collision:
+        env_kwargs["exclude_ee_from_physx_self_collision"] = True
 
     print("[DBG] creating DualArmPegHoleEnv ...", flush=True)
     mdp = DualArmPegHoleEnv(**env_kwargs)
