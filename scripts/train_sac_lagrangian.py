@@ -109,7 +109,6 @@ def parse_args():
     p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
-    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true")
 
     # obs
     p.add_argument("--use_axis_resid_obs", action="store_true")
@@ -181,7 +180,7 @@ def main():
         args.n_eval_episodes, args.num_envs, "--n_eval_episodes"
     )
 
-    from envs import DualArmPegHoleEnv
+    from envs import DualArmPegHoleCostEnv
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
     for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
                 "preinsert_offset", "rew_action", "rew_success", "rew_pos_success",
@@ -193,15 +192,13 @@ def main():
             env_kwargs[key] = value
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
-    if args.exclude_ee_from_physx_self_collision:
-        env_kwargs["exclude_ee_from_physx_self_collision"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
-    mdp = DualArmPegHoleEnv(**env_kwargs)
+    mdp = DualArmPegHoleCostEnv(**env_kwargs)
     mdp.seed(args.seed)
 
     # IsaacSim 启动后才能导入 mushroom_rl / algo
     from mushroom_rl.core import Agent, VectorCore, Logger, Dataset
-    from algo import SACLagrangian
+    from algorithm import SACLagrangian
 
     obs_dim = mdp.info.observation_space.shape[0]
     act_dim = mdp.info.action_space.shape[0]
@@ -217,12 +214,17 @@ def main():
                              output_shape=(1,), action_dim=act_dim,
                              optimizer={"class": optim.Adam, "params": {"lr": args.lr_critic}},
                              loss=F.mse_loss)
+        cost_critic_params = dict(network=CriticNetwork, input_shape=(obs_dim,),
+                                  output_shape=(1,), action_dim=act_dim,
+                                  optimizer={"class": optim.Adam, "params": {"lr": args.lr_critic}},
+                                  loss=F.mse_loss)
         return SACLagrangian(
             mdp_info=mdp.info,
             actor_mu_params=actor_params,
             actor_sigma_params=actor_params,
             actor_optimizer=actor_optimizer,
             critic_params=critic_params,
+            cost_critic_params=cost_critic_params,
             batch_size=BATCH_SIZE,
             initial_replay_size=INITIAL_REPLAY_SIZE,
             max_replay_size=MAX_REPLAY_SIZE,
@@ -299,11 +301,6 @@ def main():
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
-    logger.info(
-        "physx_self_collision_group="
-        + ("arm_links_only" if mdp._exclude_ee_from_physx_self_collision
-           else "arm_links_plus_ee")
-    )
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
                 f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
