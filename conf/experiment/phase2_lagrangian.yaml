@@ -1,0 +1,93 @@
+train_script: scripts/train_sac_lagrangian.py
+
+# Stage 2 (Lagrangian SAC): position + axis alignment, warm-start from Stage 1.
+# obs_dim must stay 34 (use_axis_resid_obs=True) to match Stage 1 checkpoint.
+# Reward adds axis term and tightens success threshold vs Stage 1.
+# Collision still goes to cost constraint; reward critic only sees task progress.
+
+num_envs: 16
+render: false
+seed: 42
+use_axis_resid_obs: true
+n_epochs: 200
+n_steps_per_epoch: 1024
+n_steps_per_fit: null
+utd: null
+
+lr_actor: 1e-4
+lr_critic: 3e-4
+lr_alpha: 3e-4
+alpha_max: 0.1
+target_entropy: -7
+n_eval_episodes: 16
+# critic_warmup_transitions: actor / α / λ 全部冻结，直到 replay 填满此值.
+# cold-start 后 critic 需要一段时间重建语义（reward 和 cost 都在同时预热）.
+# 50000 ≈ 49 epoch @ 1024 steps/epoch.
+critic_warmup_transitions: 50000
+
+initial_joint_noise: null
+preinsert_success_pos_threshold: 0.10
+preinsert_offset: null
+rew_action: null
+rew_success: 2.0
+rew_home: 0.0005
+home_weights: "1,1,1,1,0.75,0.5,0.5"
+rew_axis: 0.5
+success_axis_threshold: 0.50
+rew_pos_success: 1.0
+axis_gate_radius: 0.40
+terminal_hold_bonus: 0.0
+hold_success_steps: 10
+
+# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
+clearance_hard: 0.0
+
+# --------------------------------------------------------------------------
+# Warm-start (Stage 1 → Stage 2)
+# --------------------------------------------------------------------------
+# 支持两种来源:
+#   A. Lagrangian Stage 1 checkpoint (推荐): --actor_only_warmstart
+#      cost critic / λ / replay 全部冷启, 与新 cost_limit 和 axis reward 对齐.
+#      全量 warmstart (actor_only_warmstart: false) 也可, 但须确认 reward/cost 结构
+#      未变（Stage 2 加了 rew_axis, reward critic 语义已变 → 建议 actor-only）.
+#   B. SAC Stage 1 checkpoint: 必须 --actor_only_warmstart (SAC 无 cost critic/λ).
+#
+# 运行前确认文件存在, 或传 --load_agent 覆盖:
+#   cp results/best_hold_lag.msh results/S1_lag_best_hold.msh
+load_agent: results/best_hold_lag.msh
+actor_only_warmstart: true
+keep_replay: false
+
+# --------------------------------------------------------------------------
+# Lagrangian 专属参数
+# --------------------------------------------------------------------------
+
+# cost_limit: Stage 2 的 per-step collision 预算.
+#
+# 标定方法:
+#   1. 用 Stage 1 best actor 在 Stage 2 env 参数（rew_axis=0.5）下跑 eval.
+#   2. 或直接用 Stage 1 同一 env 的 collision rate（Stage 2 任务更难，rate 通常不低）.
+#   3. 取 baseline collision rate 的 0.5 倍.
+#
+# Stage 2 比 Stage 1 任务更难（轴对齐），碰撞率可能持平甚至上升，
+# 通常 cost_limit 不低于 Stage 1. 如需更严格安全保证可收紧.
+#
+# 占位值 0.02 = 2% per-step collision rate. 请在 Stage 1 eval 后更新此值.
+cost_limit: 0.02  # TODO: 用 Stage 1 actor eval 结果标定
+
+lr_lambda: 1e-3
+lambda_max: 100.0
+
+# actor_only_warmstart 时 λ 从 init_log_lambda 冷启.
+# Stage 1 结束时 λ 可能已较高（说明 cost 被持续违反）；Stage 2 从 0 重新学
+# 会有一段 λ 爬升期. 若 Stage 1 final_lambda 偏高（如 >5），
+# 可设 init_log_lambda: 1.5~2.0（λ≈4.5~7.4）缩短爬升过渡.
+init_log_lambda: 0.0  # TODO: 参考 Stage 1 的 final_lambda 调整
+
+gamma_cost: null
+
+# --------------------------------------------------------------------------
+
+wandb_project: bimanual_peghole
+wandb_run_name: phase2_lag_axis05_gate040_cwarm50k_actoronly_200epochs
+no_wandb: false
