@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from networks import ActorNetwork, CriticNetwork
 from scripts._eval_utils import (
+    compute_cost_metrics,
     compute_hold_metrics,
     deterministic_policy,
     parse_home_weights,
@@ -120,21 +121,6 @@ def parse_args():
     p.add_argument("--no_wandb", action="store_true")
     return p.parse_args()
 
-
-def compute_cost_metrics(dataset, n_eval_episodes):
-    """从 eval flatten dataset 的 info.data["cost"] 算 cost_rate / per-ep cost sum.
-
-    依赖 env._create_info_dictionary 把 cost 写进 step_info; flatten 后顺序与
-    reward 对齐 (probe_extra_info_cost.py 验证).
-    """
-    cost = dataset.info.data.get("cost")
-    if cost is None:
-        return {"cost_rate": float("nan"), "cost_episode_sum_mean": float("nan")}
-    cost_t = cost if isinstance(cost, torch.Tensor) else torch.as_tensor(cost)
-    cost_rate = float(cost_t.float().mean())
-    # per-episode 和: 总 cost / n_episodes (cost 是 per-step 0/1 -> 总 cost = 触发次数)
-    cost_episode_sum_mean = float(cost_t.float().sum()) / max(n_eval_episodes, 1)
-    return {"cost_rate": cost_rate, "cost_episode_sum_mean": cost_episode_sum_mean}
 
 
 def main():

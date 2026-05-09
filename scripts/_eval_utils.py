@@ -133,6 +133,22 @@ def compute_hold_metrics(dataset, mdp, hold_n_steps):
     }
 
 
+def compute_cost_metrics(dataset, n_eval_episodes):
+    """从 eval flatten dataset 的 info.data["cost"] 算 cost_rate / per-ep cost sum.
+
+    依赖 env._create_info_dictionary 把 cost 写进 step_info; flatten 后顺序与
+    reward 对齐. cost = 0/1 per-step collision indicator.
+    """
+    import torch
+    cost = dataset.info.data.get("cost")
+    if cost is None:
+        return {"cost_rate": float("nan"), "cost_episode_sum_mean": float("nan")}
+    cost_t = cost if isinstance(cost, torch.Tensor) else torch.as_tensor(cost)
+    cost_rate = float(cost_t.float().mean())
+    cost_episode_sum_mean = float(cost_t.float().sum()) / max(n_eval_episodes, 1)
+    return {"cost_rate": cost_rate, "cost_episode_sum_mean": cost_episode_sum_mean}
+
+
 def resolve_eval_episode_count(requested_episodes, num_envs, arg_name):
     """评估 episode 数与 vectorized env 对齐.
 

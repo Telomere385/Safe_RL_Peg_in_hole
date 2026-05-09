@@ -12,7 +12,7 @@
     → Dataset.flatten() / ExtraInfo.flatten()
     → fit_dataset.info.data["cost"] 与 reward 同形 1D, 顺序对齐.
 
-文件位置约束: pickle 路径绑定 algo.lagrangian_sac.SACLagrangian. 任何 load
+文件位置约束: pickle 路径绑定 algorithm.lagrangian_sac.SACLagrangian. 任何 load
 checkpoint 的脚本必须 sys.path 包含 PROJECT_ROOT (train_sac.py:33 同款).
 不要重命名 / 移动文件, 否则旧 checkpoint 失效.
 
