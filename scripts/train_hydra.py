@@ -51,7 +51,13 @@ def _as_list(value) -> list[str]:
 def _append_scalar_arg(cmd: list[str], flag: str, value) -> None:
     if value is None:
         return
-    cmd.extend([flag, str(value)])
+    s = str(value)
+    # Negative numbers (e.g. -inf, -0.5) start with '-' and would be mistaken
+    # for a new option flag by argparse when passed as a separate token.
+    if s.startswith("-"):
+        cmd.append(f"{flag}={s}")
+    else:
+        cmd.extend([flag, s])
 
 
 def _append_vector_arg(cmd: list[str], flag: str, value) -> None:
