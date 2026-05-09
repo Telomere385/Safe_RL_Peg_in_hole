@@ -619,14 +619,18 @@ class DualArmPegHoleEnv(IsaacSim):
             cost = self._last_collision_mask.to(torch.float32)
         return {"cost": cost}
 
-    def reward(self, obs, action, next_obs, absorbing):
+    def _compute_normal_reward(self, next_obs):
+        """shaped reward，不含 collision/hold-N absorbing 分支.
+
+        供 reward() 和子类（DualArmPegHoleCostEnv）共用，避免重复实现
+        joint-limit / action / home / axis-gate 等计算逻辑.
+        """
         joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
         pos_err = self._last_pos_err
         axis_err = self._last_axis_err
         full_success = self._last_success_mask.to(pos_err.dtype)
         pos_success = self._last_pos_success_mask.to(pos_err.dtype)
 
-        # 关节极限软惩罚: 超 margin 才计
         joint_range = self._joint_upper - self._joint_lower
         joint_center = 0.5 * (self._joint_upper + self._joint_lower)
         excess = torch.clamp(
@@ -637,28 +641,18 @@ class DualArmPegHoleEnv(IsaacSim):
         )
         joint_limit_norm = torch.sum(excess ** 2, dim=-1)
 
-        # action L2: pre-scale raw action, 与 action_scale 解耦
         action_sq = (self._last_raw_action ** 2).sum(dim=-1)
 
-        # home regularizer: 全 stage 通用的 tie-breaker, 偏好 q_home (胸前 ready).
-        # joint-range 归一化后逐关节加权; w_home=0 时整项消失.
-        joint_range = self._joint_upper - self._joint_lower
         home_dev = (joint_pos - self._default_joint_pos.unsqueeze(0)) / joint_range.unsqueeze(0)
         home_norm = (self._home_weights.unsqueeze(0) * (home_dev ** 2)).sum(dim=-1)
 
-        # axis-gate: 远处 (pos_err >= gate_radius) 不施加 axis 压力, 保留 Stage 1
-        # 学到的位置策略; 进入 [pos_th, gate_radius] 区间后线性 ramp; pos 进阈
-        # 后 gate 满. gate_radius=inf 时 gate 恒 1 (向后兼容, 当前 stage 不门控).
         if math.isfinite(self._axis_gate_radius):
             denom = max(self._axis_gate_radius - self._preinsert_success_pos_threshold, 1e-6)
             axis_gate = ((self._axis_gate_radius - pos_err) / denom).clamp(0.0, 1.0)
         else:
             axis_gate = torch.ones_like(pos_err)
 
-        # rew_axis=0 时 axis 项消失, 这就是 Stage 1 行为. Stage 2 通过 CLI 把它打开.
-        # rew_pos_success>0 维持 Stage 1 已学到的"进 pos 阈值给 bonus"信号 — 避免
-        # Stage 2 加 axis 后, Stage 1 成功状态 (pos 进但 axis 未达) 突然失去 bonus 造成断崖.
-        normal = (
+        return (
             -self._w_pos * pos_err
             - self._w_axis * axis_gate * axis_err
             - self._w_joint_limit * joint_limit_norm
@@ -668,7 +662,9 @@ class DualArmPegHoleEnv(IsaacSim):
             + self._w_success * full_success
         )
 
-        # 三路 reward 选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
+    def reward(self, obs, action, next_obs, absorbing):
+        normal = self._compute_normal_reward(next_obs)
+        # 三路选择: collision (硬 absorbing) > hold-N (软 absorbing) > normal
         absorbing_r = self._r_min / (1.0 - self.info.gamma)
         r = torch.where(
             self._last_collision_mask,

@@ -1,10 +1,9 @@
 train_script: scripts/train_sac.py
 
-# M2 / Step 2: position + final axis alignment.
-# Warm-start from M1' (34-dim, use_axis_resid_obs=True) actor-only.
-# obs_dim must stay 34 to match the Phase 1 checkpoint.
+# Stage 2: position + axis alignment.
+# Warm-start from Stage 1 (34-dim, use_axis_resid_obs=True) actor-only.
+# obs_dim must stay 34 to match the Stage 1 checkpoint.
 
-# Basic SAC/vectorized rollout parameters.
 num_envs: 16
 render: false
 seed: 42
@@ -14,8 +13,6 @@ n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
 
-
-# Network/entropy parameters.
 lr_actor: 1e-4
 lr_critic: 3e-4
 lr_alpha: 3e-4
@@ -24,7 +21,6 @@ target_entropy: -7
 n_eval_episodes: 16
 critic_warmup_transitions: 50000
 
-# Current DualArmPegHoleEnv preinsert-stage flags.
 initial_joint_noise: null
 preinsert_success_pos_threshold: 0.10
 preinsert_offset: null
@@ -42,16 +38,18 @@ axis_gate_radius: 0.40
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
+# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
+# 与 PhysX 力检测 OR, 补偿 PhysX 在 1-5cm 近距离的失明区.
+# 关闭请设 clearance_hard: -.inf (注意负数会走 --clearance_hard=-.inf 形式).
+clearance_hard: 0.0
+
 # Warm-start controls.
-# Copy Phase 1 best_hold.msh to this path before launching:
-#   cp results/best_hold.msh results/phase1_m1p_34dim_pos10cm_200epochs_best_hold.msh
+# 运行前确认此文件存在, 或传 --load_agent 覆盖:
+#   cp results/best_hold.msh results/S1_axisresid_home_uniform_repro_best_hold.msh
 load_agent: results/S1_axisresid_home_uniform_repro_best_hold.msh
 actor_only_warmstart: true
 keep_replay: false
 
-# Logging.
 wandb_project: bimanual_peghole
-wandb_run_name: phase2_m2_axis05_gate040_cwarm50k_actoronly_200epochs
+wandb_run_name: phase2_axis05_gate040_cwarm50k_actoronly_200epochs
 no_wandb: false
-extra_args:
-  - "--clearance_hard=-inf"
