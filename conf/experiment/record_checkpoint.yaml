@@ -1,0 +1,35 @@
+train_script: scripts/record_video.py
+
+# checkpoint 目录录制配置.
+# 自动录制 checkpoint_dir 下所有 .msh 文件, Isaac Sim 只启动一次顺序录制.
+# 视频文件名: <tag>_<agent_stem>_episode_000.mp4, ...
+#
+# 用法:
+#   # 直接运行 (使用此文件中的默认路径)
+#   python scripts/train_hydra.py --multirun experiment@train=record_checkpoint
+#
+#   # 覆盖 checkpoint 目录 (每次录新的 checkpoint 时只需改这一个参数)
+#   python scripts/train_hydra.py --multirun experiment@train=record_checkpoint \
+#       train.checkpoint_dir=results/checkpoints/2026-05-07/11-59-24 \
+#       train.tag=ckpt_20260507
+
+# --- checkpoint 目录 (替代单 agent 的 agent_path) ---
+# 路径相对于容器内项目根目录 /workspace/Safe_RL_Peg_in_hole
+checkpoint_dir: results/checkpoints/2026-05-07/11-59-24
+
+# --- env (必须与训练时一致) ---
+num_envs: 2              # cloner bug 要求 >= 2; 录制只用 viz_env_idx=0
+use_axis_resid_obs: true
+preinsert_success_pos_threshold: 0.10
+rew_home: 0.0005
+hold_success_steps: 10
+clearance_hard: -.inf    # phase1/2 训练时均禁用球形代理碰撞; 不设置默认 0.0 会提前截断 episode
+
+# --- 录制参数 ---
+n_episodes: 1            # 每个 agent 录制的 episode 数
+viz_env_idx: 0
+# output_dir 不设置: 自动推导为 results/videos/<DATE>/<TIME>
+fps: 30
+width: 1280
+height: 720
+tag: ckpt                # 前缀; 最终文件名: ckpt_best_agent_episode_000.mp4
