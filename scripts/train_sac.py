@@ -138,6 +138,10 @@ def parse_args():
                    help="覆盖 env 的 arm sphere proxy 半径 (默认 0.06m).")
     p.add_argument("--proxy_ee_radius", type=float, default=None,
                    help="覆盖 env 的 EE sphere proxy 半径 (默认 0.04m).")
+    p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
+                   help="Stage 3 peg/hole 真实 collider 用: PhysX arm_L vs arm_R "
+                        "self-collision 分组排除左右 EE link, 避免正常 peg-hole "
+                        "接触被 hard absorbing 误杀. EE 区域仍由 sphere-proxy 兜底.")
     p.add_argument("--use_axis_resid_obs", action="store_true",
                    help="agent obs 32 → 34 维: axis_dot[1] 替换成 axis_resid[3] = "
                         "peg_axis + hole_axis (world frame). 模长 ∈ [0, 2], "
@@ -206,6 +210,8 @@ def main():
     # bool flags: 直接读 args, 不能用 None 哨兵 (action="store_true" 默认 False)
     if args.use_axis_resid_obs:
         env_kwargs["use_axis_resid_obs"] = True
+    if args.exclude_ee_from_physx_self_collision:
+        env_kwargs["exclude_ee_from_physx_self_collision"] = True
     env_kwargs["success_hold_steps"] = args.hold_success_steps
     mdp = DualArmPegHoleEnv(**env_kwargs)
     mdp.seed(args.seed)
@@ -312,6 +318,11 @@ def main():
     logger.info(f"obs_dim={obs_dim} ({obs_mode})  "
                 f"act_dim={act_dim}  horizon={mdp.info.horizon}")
     logger.info(f"action_scale={mdp._action_scale:.3f}")
+    logger.info(
+        "physx_self_collision_group="
+        + ("arm_links_only" if mdp._exclude_ee_from_physx_self_collision
+           else "arm_links_plus_ee")
+    )
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
                 f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "

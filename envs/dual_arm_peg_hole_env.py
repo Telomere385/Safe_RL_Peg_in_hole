@@ -43,14 +43,20 @@ Reward (统一骨架):
         * PhysX 接触力 > collision_force_threshold
         * sphere-proxy clearance < clearance_hard (PhysX 在 1cm-5cm 边缘失明
           的几何兜底, 默认 clearance_hard=0.0 即球壳一接触就算碰撞)
-    - hold-N (success 连续 N 步): 软 absorbing + terminal_hold_bonus (可选, =0 关闭)
     - success 本身不终止 (沿用 phase 1 结论, 避免 Q-target 边界断崖, 见
       feedback_bimanual_reward_shaping.md Rule 1)
+    - hold-N (success 连续 N 步) 软 absorbing + terminal_hold_bonus 默认关闭
+      (terminal_hold_bonus=0). 启用时 (传 >0) 会在 episode 收尾给 cliff,
+      让 -w_pos*pos_err / -w_axis*axis_err 的连续梯度提前停止, 阈值边精度
+      明显劣化; 当前默认走 horizon, 让精度信号跑满, hold_success_steps
+      仅作 eval 指标 (compute_hold_metrics 的 hold_n_steps).
 
 PEG/HOLE 几何 — 解析式 frame (不依赖 XFormPrim):
-    peg/hole 是视觉-only 的 USD over, 挂在左/右 EE 下, 没有 RigidBodyAPI /
-    MassAPI / CollisionAPI (build_peghole_usd.py 验证). 它们的 pose 完全由
-    EE link 的世界位姿 + 一个常量本地偏移决定:
+    peg/hole 是 EE link 下的 USD over. 当前 USD asset 已带 invisible collision
+    proxy (peg Cylinder; hole Cube wall ring, CollisionAPI/PhysxCollisionAPI),
+    但 Peg/Hole 本身故意没有 RigidBodyAPI / MassAPI: 它们是 EE link 的附属
+    collision shapes, 不独立进入 articulation 质量矩阵. reward/obs 里的几何
+    pose 完全由 EE link 的世界位姿 + 一个常量本地偏移解析计算:
         peg_tip_world  = LeftEE_pos  + R(LeftEE_quat)  · PEG_TIP_OFFSET_IN_LEFTEE
         peg_axis_world =                R(LeftEE_quat)  · PEG_AXIS_IN_LEFTEE
         hole_entry / hole_axis 同理 (RightEE).
@@ -216,6 +222,11 @@ class DualArmPegHoleEnv(IsaacSim):
         clearance_hard=0.0,
         proxy_arm_radius=ARM_PROXY_RADIUS,
         proxy_ee_radius=EE_PROXY_RADIUS,
+        # Stage 3 里 peg/hole 有真实 collider, 且挂在左右 EE link 下。若继续把
+        # EE link 放进 PhysX self-collision group, 正常 peg-hole 接触会被 arm_L
+        # vs arm_R hard absorbing 误杀。打开此开关后, PhysX self-collision 只看
+        # iiwa arm links; EE 区域仍由 sphere-proxy 几何兜底负责。
+        exclude_ee_from_physx_self_collision=False,
         # obs 模式:
         #   use_axis_resid_obs=True → 34 维 (peg_axis+hole_axis 求和替换 axis_dot,
         #                              全程光滑无奇异, 当前 Stage 2 推荐)
@@ -285,6 +296,9 @@ class DualArmPegHoleEnv(IsaacSim):
         self._clearance_hard = float(clearance_hard)
         self._proxy_arm_radius = float(proxy_arm_radius)
         self._proxy_ee_radius = float(proxy_ee_radius)
+        self._exclude_ee_from_physx_self_collision = bool(
+            exclude_ee_from_physx_self_collision
+        )
         self._use_axis_resid_obs = bool(use_axis_resid_obs)
         if self._use_axis_resid_obs:
             self._agent_obs_dim = AGENT_OBS_DIM_AXIS_RESID
@@ -329,7 +343,10 @@ class DualArmPegHoleEnv(IsaacSim):
             ("left_ee_rot", LEFT_EE_PATH, ObservationType.BODY_ROT, None),
             ("right_ee_rot", RIGHT_EE_PATH, ObservationType.BODY_ROT, None),
         ]
-        collision_groups = [("arm_L", LEFT_ARM_GROUP), ("arm_R", RIGHT_ARM_GROUP)]
+        if self._exclude_ee_from_physx_self_collision:
+            collision_groups = [("arm_L", LEFT_ARM_LINKS), ("arm_R", RIGHT_ARM_LINKS)]
+        else:
+            collision_groups = [("arm_L", LEFT_ARM_GROUP), ("arm_R", RIGHT_ARM_GROUP)]
 
         super().__init__(
             usd_path=str(self._usd_path),
@@ -591,6 +608,16 @@ class DualArmPegHoleEnv(IsaacSim):
         self._last_hold_done_mask = hold_done
 
         return collision | hold_done
+
+    def _create_info_dictionary(self, obs):
+        # cost = collision indicator (PhysX OR sphere-proxy), 给 SACLagrangian 用.
+        # is_absorbing 在 step_all 里早于本方法调用 (isaacsim_env.py:174 vs :176),
+        # 因此 _last_collision_mask 已经是当前 step 的最新值.
+        if self._last_collision_mask is None:
+            cost = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
+        else:
+            cost = self._last_collision_mask.to(torch.float32)
+        return {"cost": cost}
 
     def reward(self, obs, action, next_obs, absorbing):
         joint_pos = next_obs[..., _AGENT_OBS_JOINT_POS]
