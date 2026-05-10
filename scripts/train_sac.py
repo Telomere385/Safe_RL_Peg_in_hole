@@ -150,6 +150,7 @@ def parse_args():
                         "success_axis_threshold 仍然用旧的 1+dot 量纲 (0.2 ≈ ±37° 锥). "
                         "**注意**: obs 维度变, 32 维 checkpoint 不能 warm-start 到 34 维.")
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
+    p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_group", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -373,7 +374,8 @@ def main():
     if not args.no_wandb:
         import wandb
         wandb_run = wandb.init(
-            project=args.wandb_project, name=args.wandb_run_name,
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_run_name,
             group=args.wandb_group,
             config={**vars(args), "algo": "SAC",
                     "target_entropy_resolved": target_entropy,
