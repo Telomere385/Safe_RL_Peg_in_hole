@@ -1,9 +1,9 @@
 """Lagrangian SAC 训练 — 双臂 peg-in-hole, mushroom-rl + VectorCore.
 
 跟 train_sac.py 的差异:
-- 算法换成 algo.lagrangian_sac.SACLagrangian (在 PROJECT_ROOT/algo/ 下).
+- 算法换成 algorithm.lagrangian_sac.SACLagrangian (在 PROJECT_ROOT/algorithm/ 下).
 - env._create_info_dictionary 必须返回 {"cost": tensor} (已在
-  envs/dual_arm_peg_hole_env.py 实现).
+  envs/dual_arm_peg_hole_cost_env.py 实现).
 - 多了 --cost_limit / --lr_lambda / --lambda_max / --init_log_lambda /
   --gamma_cost flags.
 - 每 epoch eval 多算 cost_rate, wandb 加 lambda / cost_q_mean.
@@ -19,6 +19,15 @@ Cost signal 调标:
 - 设 --cost_limit 之前先用 SAC baseline 跑一次 64-ep eval, 记录
   absorb_sphere_per_epoch / n_steps_per_epoch (per-step 触发率), 取其 0.5 倍
   做起步预算. 设 cost_limit=0 会让 λ 一上来就爆.
+
+整体架构：
+  envs/dual_arm_peg_hole_cost_env.py   ← cost 信号来源 (DualArmPegHoleCostEnv)
+           ↓  _create_info_dictionary() → {"cost": tensor}
+  algorithm/lagrangian_sac.py          ← ConstrainedReplayMemory + SACLagrangian
+           ↓  fit() 读 dataset.info.data["cost"]
+  scripts/train_sac_lagrangian.py      ← 训练入口，接所有 CLI 参数
+  scripts/_eval_utils.py               ← compute_cost_metrics() 评估 cost 指标
+
 """
 
 import argparse
@@ -116,6 +125,7 @@ def parse_args():
 
     # wandb
     p.add_argument("--wandb_project", type=str, default="bimanual_peghole")
+    p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
     p.add_argument("--wandb_group", type=str, default=None)
     p.add_argument("--no_wandb", action="store_true")
@@ -326,7 +336,8 @@ def main():
     if not args.no_wandb:
         import wandb
         wandb_run = wandb.init(
-            project=args.wandb_project, name=args.wandb_run_name,
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_run_name,
             group=args.wandb_group,
             config={**vars(args), "algo": "SACLagrangian",
                     "target_entropy_resolved": target_entropy,
