@@ -476,9 +476,6 @@ Stage 2 实验 2 (axis_th=0.30 重训) ckpt 没单独备份 (训完直接被 one
 - **`conf/experiment/phase1.yaml:40`** 仍强制 `--clearance_hard=-inf` (关闭
   sphere-proxy hard absorbing). 当前主线是 `clearance_hard=0.0` 默认开. 如果
   从 Hydra 跑 phase 1 复现, 会得到 collision-blind 的旧版本.
-- **`scripts/train_sac_lagrangian.py:204`** 写 `from algo import SACLagrangian`,
-  但仓库实际目录是 `algorithm/`. import 失败. Stage 3 如果想试 Lagrangian SAC
-  需要先修这个 import (跟当前训练主线无关, 主线走 `train_sac.py`).
 
 ## 历史
 
@@ -491,3 +488,122 @@ Stage 2 实验 2 (axis_th=0.30 重训) ckpt 没单独备份 (训完直接被 one
   sweep 完成. 删除 2026-05-04/05/06/07 的 pre-collision ckpt (S1_axisresid_*,
   S2_*, M2_*, S2p*, S3_warmstart_baseline 等), 不再作为 baseline 比较.
 - 2026-05-04 之前: 早期 M1/M2 调参, 没有 sphere-proxy collision, 不可比.
+
+---
+
+# bimanual_peghole_lagrangianSAC
+
+## 基本说明
+
+双臂 KUKA iiwa 在 IsaacSim 中做 peg-in-hole 的 Lagrangian SAC 安全约束训练 (mushroom-rl 2.0).
+基于 `bimanual_peghole` SAC 主线, 将碰撞约束从 reward 剥离为独立 cost 信号, 用 Lagrange 乘子
+λ 动态控制安全预算.
+
+标准 SAC 把碰撞编码为巨大负奖励 (`r_min/(1-γ) ≈ -200`), reward critic 和安全信号混在一起难以分别调参.
+Lagrangian SAC 把碰撞从 reward 里剥出来, 用独立 cost critic Q_C 学习, 用 Lagrange 乘子 λ 动态
+控制安全预算, reward critic 只专注任务进展.
+
+### 与 SAC 的核心差异
+
+| 方面 | SAC (`train_sac.py`) | Lagrangian SAC (`train_sac_lagrangian.py`) |
+|------|----------------------|--------------------------------------------|
+| Replay buffer | 标准 `(s,a,r,s',absorb,last)` | `ConstrainedReplayMemory` 多存一列 cost `c` |
+| Critic 数量 | 2 个 reward critic | 4 个: reward critic ×2 + cost critic ×2 |
+| 碰撞处理 | reward = `r_min/(1-γ) ≈ -200`, episode 终止 | reward = shaped (不加大负奖励), cost = 1.0, episode 仍终止 |
+| Actor loss | `(α·logπ − Q_R).mean()` | `(α·logπ − Q_R + λ·Q_C).mean()` |
+| 环境类 | `DualArmPegHoleEnv` | `DualArmPegHoleCostEnv` |
+
+### cost_limit 标定方法
+
+`--cost_limit` 是训练最关键的超参. 设 0 会让 λ 一上来就爆; 设太高约束形同虚设.
+
+推荐流程:
+
+1. 用现有 SAC checkpoint 跑一次短 eval (64 ep 即可):
+   ```bash
+   python scripts/eval_sac.py --headless --num_envs 16 --n_episodes 64 \
+     --agent_path results/<sac_checkpoint>.msh [... 同训练的 env 参数 ...]
+   ```
+2. 读输出的 `absorb_sphere` 计数, 算 per-step collision rate:
+   ```
+   collision_rate = absorb_sphere_per_epoch / n_steps_per_epoch
+   ```
+3. 取 0.5× 作为起步预算: `--cost_limit = 0.5 × collision_rate`
+4. 训练中看 wandb `cost_violation = cost_rate − cost_limit`:
+   - 长期正 → λ 持续上升, 正常收紧
+   - 长期负 → cost_limit 过松, 考虑降低
+   - λ 冲到 `lambda_max` 且 `cost_violation` 仍正 → cost_limit 太严或任务太难
+
+### 关键超参数说明
+
+| 参数 | 默认值 | 建议范围 | 说明 |
+|------|--------|----------|------|
+| `--cost_limit` | (必填) | `0.5 × baseline_rate` | per-step cost 预算; 见上方标定流程 |
+| `--lr_lambda` | `1e-3` | `1e-4 ~ 1e-3` | 比 `lr_actor` 低 1–10×; 太高 λ 震荡, 太低约束收紧慢 |
+| `--lambda_max` | `100.0` | `50 ~ 200` | λ 上限; 频繁冲顶说明 cost_limit 太严或任务太难 |
+| `--init_log_lambda` | `0.0` | `0.0 ~ 2.0` | λ 初值 = `exp(init_log_lambda)`; 从 SAC ckpt warmstart 可适当调高 |
+| `--gamma_cost` | `None` (= env γ) | `None` 或 `0.95~0.99` | None 复用 env γ=0.99; 设小一点让约束更短视、收紧更快 |
+
+### 训练命令
+
+从 SAC checkpoint warm-start (actor-only, 推荐起点):
+
+```bash
+cd ~/bimanual_peghole && conda activate safe_rl
+
+python scripts/train_sac_lagrangian.py \
+  --num_envs 16 --n_epochs 200 --n_steps_per_epoch 1024 --n_steps_per_fit 16 --n_eval_episodes 16 \
+  --use_axis_resid_obs \
+  --load_agent results/<sac_checkpoint>.msh --actor_only_warmstart \
+  --critic_warmup_transitions 50000 \
+  --preinsert_success_pos_threshold 0.10 --success_axis_threshold <axis_th> \
+  --rew_axis <rew_axis> --rew_pos_success 1.0 --rew_success <rew_success> --rew_home 0.0005 \
+  --lr_actor 5e-5 --lr_alpha 3e-4 --alpha_max 0.05 --target_entropy -10 \
+  --cost_limit <0.5×baseline_collision_rate> \
+  --lr_lambda 1e-3 --lambda_max 100 --init_log_lambda 0.0 \
+  --seed 0 \
+  --wandb_run_name <run_name>
+```
+
+训练结束**立即**备份 ckpt (顶层文件会被下次训练覆盖):
+
+```bash
+cp results/best_agent_lag.msh  results/<run_name>_best_agent.msh
+cp results/best_hold_lag.msh   results/<run_name>_best_hold.msh
+cp results/final_agent_lag.msh results/<run_name>_final.msh
+```
+
+### Eval 时看什么
+
+| 指标 | 健康表现 | 异常信号 |
+|------|----------|----------|
+| `cost_rate` | 逐渐收敛到 ≤ `cost_limit` | 长期 >> cost_limit → λ 失控或任务太难 |
+| `cost_violation` | 先正后收敛到 ≤ 0 | 持续正 + λ 冲顶 → cost_limit 太严 |
+| `lambda` (λ) | 平稳增长后趋于稳定 | 爆到 `lambda_max` → 上调 `lambda_max` 或放松 `cost_limit` |
+| `J` | 不低于 SAC baseline 太多 | 崩到 baseline 一半以下 → `lr_lambda` 太高或 `cost_limit` 太严 |
+| `hold_success_rate` | 与 SAC baseline 可比 | 大幅下降 → λ 过大压制了 actor |
+
+> `best_agent_lag.msh` 是最高 J 的 ckpt, **不保证满足 cost_limit** (高 J 可能在 λ
+> 收紧之前就出现). 部署前在 wandb `cost_rate` 时间线上核查对应 epoch 是否达标.
+
+### Warmstart 路径
+
+**SAC → Lagrangian SAC** (跨算法, 必须 `--actor_only_warmstart`):
+
+```bash
+--load_agent results/<sac_ckpt>.msh --actor_only_warmstart
+# critic / cost critic / α / λ / replay 全部冷启动; --keep_replay 此时被忽略
+```
+
+**Lagrangian SAC → Lagrangian SAC** (同算法全量, 保留旧 critic 和 replay):
+
+```bash
+--load_agent results/<lag_ckpt>.msh
+# 加 --keep_replay 可保留旧 replay buffer (reward/cost 函数未变时才合理)
+```
+
+**Lagrangian SAC → Lagrangian SAC (actor-only)** (reward 或 cost 函数有改动时):
+
+```bash
+--load_agent results/<lag_ckpt>.msh --actor_only_warmstart
+```
