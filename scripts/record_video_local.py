@@ -20,12 +20,15 @@ import argparse
 import sys
 from pathlib import Path
 
+import torch
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts._eval_utils import parse_home_weights
+from scripts._eval_utils import deterministic_policy, parse_home_weights
 from scripts.record_video import (
-    _record_one_agent,
+    _get_frame,
+    _make_writer,
     _setup_offscreen_camera,
 )
 
@@ -79,6 +82,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--warmup_steps", type=int, default=10)
+    p.add_argument(
+        "--no_world_render_sync",
+        action="store_true",
+        help=(
+            "Do not call mdp._world.render() after each physics step. The default "
+            "keeps local UI/Fabric transforms synchronized before grabbing frames."
+        ),
+    )
+    p.add_argument(
+        "--debug_motion_every",
+        type=int,
+        default=25,
+        help="Print action and joint motion diagnostics every N steps. Use 0 to disable.",
+    )
     p.add_argument(
         "--stochastic",
         action="store_true",
@@ -155,6 +172,104 @@ def _build_env_kwargs(args: argparse.Namespace) -> dict:
     return env_kwargs
 
 
+def _record_one_agent_local(mdp, agent, args, rec_annot, out_dir: Path, prefix: str) -> int:
+    """Record one agent, forcing render synchronization for local visualization."""
+    env_mask = torch.ones(args.num_envs, dtype=torch.bool, device=mdp._device)
+
+    obs, _ = mdp.reset_all(env_mask)
+    if not args.no_world_render_sync:
+        mdp._world.render()
+
+    episode_steps = torch.zeros(args.num_envs, dtype=torch.long, device=mdp._device)
+    prev_joint_pos = obs[:, :14].clone()
+
+    ep_idx = 0
+    step_count = 0
+    writer = None
+    ep_frames = 0
+
+    print(f"[LOCAL REC] agent '{prefix.rstrip('_')}': recording {args.n_episodes} episode(s)")
+
+    try:
+        while ep_idx < args.n_episodes:
+            if args.stochastic:
+                action, _ = agent.policy.draw_action(obs)
+            else:
+                with deterministic_policy(agent):
+                    action, _ = agent.policy.draw_action(obs)
+
+            next_obs, reward, absorbing, _info = mdp.step_all(env_mask, action)
+            step_count += 1
+            episode_steps[env_mask] += 1
+            last = absorbing | (episode_steps >= mdp.info.horizon)
+
+            if not args.no_world_render_sync:
+                mdp._world.render()
+
+            if args.debug_motion_every and step_count % args.debug_motion_every == 0:
+                joint_delta = (next_obs[:, :14] - prev_joint_pos).abs().mean().item()
+                action_abs = torch.as_tensor(action).abs().mean().item()
+                reward_mean = torch.as_tensor(reward).float().mean().item()
+                print(
+                    f"[LOCAL REC] step={step_count:04d} "
+                    f"mean|action|={action_abs:.4f} "
+                    f"mean|dq|={joint_delta:.6f} "
+                    f"reward={reward_mean:.3f}"
+                )
+                prev_joint_pos = next_obs[:, :14].clone()
+
+            other_last = last.clone()
+            other_last[args.viz_env_idx] = False
+            if other_last.any():
+                reset_obs, _ = mdp.reset_all(other_last)
+                if not args.no_world_render_sync:
+                    mdp._world.render()
+                next_obs = next_obs.clone()
+                next_obs[other_last] = reset_obs[other_last]
+                episode_steps[other_last] = 0
+
+            frame = _get_frame(rec_annot, args.width, args.height)
+
+            if writer is None:
+                out_path = out_dir / f"{prefix}episode_{ep_idx:03d}.mp4"
+                writer = _make_writer(out_path, args.fps, args.width, args.height)
+                ep_frames = 0
+                print(f"[LOCAL REC]   episode {ep_idx:03d} -> {out_path}")
+
+            writer.write(frame)
+            ep_frames += 1
+
+            if last[args.viz_env_idx].item():
+                writer.release()
+                writer = None
+                print(
+                    f"[LOCAL REC]   episode {ep_idx:03d} done: {ep_frames} frames "
+                    f"(total steps: {step_count})"
+                )
+                ep_idx += 1
+
+                if ep_idx < args.n_episodes:
+                    obs, _ = mdp.reset_all(env_mask)
+                    if not args.no_world_render_sync:
+                        mdp._world.render()
+                    episode_steps.zero_()
+                    prev_joint_pos = obs[:, :14].clone()
+                    continue
+
+            obs = next_obs
+
+            if step_count > args.n_episodes * mdp.info.horizon * 3:
+                print("[LOCAL REC] warning: exceeded expected step limit; stopping")
+                break
+
+    finally:
+        if writer is not None:
+            writer.release()
+            print(f"[LOCAL REC] interrupted; released writer for episode {ep_idx:03d}")
+
+    return ep_idx
+
+
 def main() -> None:
     args = parse_args()
 
@@ -206,7 +321,7 @@ def main() -> None:
 
         agent = Agent.load(str(checkpoint_path))
         prefix = f"{args.tag}_{checkpoint_path.stem}_" if args.tag else f"{checkpoint_path.stem}_"
-        done = _record_one_agent(mdp, agent, args, rec_annot, out_dir, prefix)
+        done = _record_one_agent_local(mdp, agent, args, rec_annot, out_dir, prefix)
     finally:
         mdp.stop()
 
