@@ -7,7 +7,7 @@ num_envs: 16
 render: false
 seed: 42
 use_axis_resid_obs: true
-n_epochs: 100
+n_epochs: 50
 n_steps_per_epoch: 1024
 n_steps_per_fit: null
 utd: null
@@ -43,6 +43,6 @@ proxy_ee_radius: 0.04
 
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: phase1_seed42
+wandb_run_name: SAC_phase1_seed42_new
 wandb_group: phase1_seed_sweep
 no_wandb: false
