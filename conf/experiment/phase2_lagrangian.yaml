@@ -105,5 +105,5 @@ gamma_cost: null
 
 wandb_project: bimanual_peghole
 wandb_entity: safe_rl_2026_lund
-wandb_run_name: phase2_lag_axis10_rew40_gate040_cwarm50k_actoronly_lr5e5_alpha005_te10
+wandb_run_name: lag_phase1_seed42
 no_wandb: false
