@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -88,6 +89,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Do not call mdp._world.render() after each physics step. The default "
             "keeps local UI/Fabric transforms synchronized before grabbing frames."
+        ),
+    )
+    p.add_argument(
+        "--no_force_render_step",
+        action="store_true",
+        help=(
+            "Do not force internal mdp._world.step(render=False) calls to render=True. "
+            "The default is needed when local recordings show stale USD/default poses."
         ),
     )
     p.add_argument(
@@ -170,6 +179,37 @@ def _build_env_kwargs(args: argparse.Namespace) -> dict:
         env_kwargs["exclude_ee_from_physx_self_collision"] = True
 
     return env_kwargs
+
+
+@contextmanager
+def _force_world_step_render(mdp, enabled: bool):
+    """Temporarily force Isaac world.step(..., render=True) for local recording.
+
+    The training/eval environment intentionally steps with render=False. That keeps
+    tensor observations fresh, but local RTX/Replicator output can keep showing stale
+    USD articulation poses. For recording, every internal physics step must also
+    render so the viewport/render product sees the same pose as the policy.
+    """
+    if not enabled:
+        yield
+        return
+
+    original_step = mdp._world.step
+
+    def step_with_render(*args, **kwargs):
+        if "render" in kwargs:
+            kwargs["render"] = True
+        elif args and isinstance(args[0], bool):
+            args = (True, *args[1:])
+        else:
+            kwargs["render"] = True
+        return original_step(*args, **kwargs)
+
+    mdp._world.step = step_with_render
+    try:
+        yield
+    finally:
+        mdp._world.step = original_step
 
 
 def _record_one_agent_local(mdp, agent, args, rec_annot, out_dir: Path, prefix: str) -> int:
@@ -321,7 +361,8 @@ def main() -> None:
 
         agent = Agent.load(str(checkpoint_path))
         prefix = f"{args.tag}_{checkpoint_path.stem}_" if args.tag else f"{checkpoint_path.stem}_"
-        done = _record_one_agent_local(mdp, agent, args, rec_annot, out_dir, prefix)
+        with _force_world_step_render(mdp, enabled=not args.no_force_render_step):
+            done = _record_one_agent_local(mdp, agent, args, rec_annot, out_dir, prefix)
     finally:
         mdp.stop()
 
