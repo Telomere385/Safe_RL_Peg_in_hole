@@ -468,14 +468,7 @@ Stage 2 实验 2 (axis_th=0.30 重训) ckpt 没单独备份 (训完直接被 one
 
 进 Stage 3 前最好先 cleanup 这几处 (或至少知道避开):
 
-- **`conf/experiment/phase2.yaml`** 还是 2026-05 之前的旧 hyperparams
-  (`alpha_max=0.10`, `target_entropy=-7`, `lr_actor=1e-4`, `rew_axis=0.5`,
-  `rew_success=2.0`, `success_axis_threshold=0.50`, `load_agent` 指向已删除的
-  `S1_axisresid_home_uniform_repro_best_hold.msh`). **不要走 Hydra/YAML 路径
-  跑 Stage 2**, 用上面 README 的 CLI 命令是当前 verified 配方.
-- **`conf/experiment/phase1.yaml:40`** 仍强制 `--clearance_hard=-inf` (关闭
-  sphere-proxy hard absorbing). 当前主线是 `clearance_hard=0.0` 默认开. 如果
-  从 Hydra 跑 phase 1 复现, 会得到 collision-blind 的旧版本.
+- 已全部更新
 
 ## 历史
 
