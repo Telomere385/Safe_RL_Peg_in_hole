@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -83,6 +85,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--warmup_steps", type=int, default=10)
+    p.add_argument(
+        "--viewport_capture_wait_frames",
+        type=int,
+        default=8,
+        help="How many render ticks to wait for each viewport capture file.",
+    )
+    p.add_argument(
+        "--frame_source",
+        choices=("viewport", "replicator"),
+        default="viewport",
+        help=(
+            "viewport records the same render path as the Isaac Sim UI. "
+            "replicator uses the old offscreen render product path."
+        ),
+    )
     p.add_argument(
         "--no_world_render_sync",
         action="store_true",
@@ -212,7 +229,53 @@ def _force_world_step_render(mdp, enabled: bool):
         mdp._world.step = original_step
 
 
-def _record_one_agent_local(mdp, agent, args, rec_annot, out_dir: Path, prefix: str) -> int:
+def _setup_viewport_camera(position, look_at):
+    from isaacsim.core.utils.viewports import set_camera_view
+    from omni.kit.viewport.utility import get_active_viewport
+
+    set_camera_view(
+        eye=position,
+        target=look_at,
+        camera_prim_path="/OmniverseKit_Persp",
+    )
+    viewport = get_active_viewport()
+    if viewport is None:
+        raise RuntimeError("No active Isaac Sim viewport found for local recording.")
+    return viewport
+
+
+def _read_viewport_frame(mdp, viewport, frame_path: Path, width: int, height: int,
+                         wait_frames: int):
+    import cv2
+    from omni.kit.viewport.utility import capture_viewport_to_file
+
+    try:
+        frame_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    capture_viewport_to_file(viewport, file_path=str(frame_path))
+
+    frame = None
+    for _ in range(wait_frames):
+        mdp._world.render()
+        if frame_path.exists() and frame_path.stat().st_size > 0:
+            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if frame is not None:
+                break
+        time.sleep(0.001)
+
+    if frame is None:
+        raise RuntimeError(
+            f"Viewport capture did not produce a readable frame after "
+            f"{wait_frames} render ticks: {frame_path}"
+        )
+    if frame.shape[1] != width or frame.shape[0] != height:
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    return frame
+
+
+def _record_one_agent_local(mdp, agent, args, get_frame, out_dir: Path, prefix: str) -> int:
     """Record one agent, forcing render synchronization for local visualization."""
     env_mask = torch.ones(args.num_envs, dtype=torch.bool, device=mdp._device)
 
@@ -268,7 +331,7 @@ def _record_one_agent_local(mdp, agent, args, rec_annot, out_dir: Path, prefix: 
                 next_obs[other_last] = reset_obs[other_last]
                 episode_steps[other_last] = 0
 
-            frame = _get_frame(rec_annot, args.width, args.height)
+            frame = get_frame()
 
             if writer is None:
                 out_path = out_dir / f"{prefix}episode_{ep_idx:03d}.mp4"
@@ -347,22 +410,46 @@ def main() -> None:
             f"eye={tuple(round(x, 3) for x in cam_eye)} "
             f"target={tuple(round(x, 3) for x in cam_target)}"
         )
-        rec_annot, _rec_rp = _setup_offscreen_camera(
-            args.width, args.height, cam_eye, cam_target
-        )
-
-        import omni.replicator.core as rep
-
-        print("[LOCAL REC] warming up render pipeline ...", flush=True)
-        for _ in range(args.warmup_steps):
-            rep.orchestrator.step(rt_subframes=1)
-
         from mushroom_rl.core import Agent
 
         agent = Agent.load(str(checkpoint_path))
         prefix = f"{args.tag}_{checkpoint_path.stem}_" if args.tag else f"{checkpoint_path.stem}_"
-        with _force_world_step_render(mdp, enabled=not args.no_force_render_step):
-            done = _record_one_agent_local(mdp, agent, args, rec_annot, out_dir, prefix)
+        with tempfile.TemporaryDirectory(prefix="record_video_local_") as tmp:
+            if args.frame_source == "viewport":
+                if args.headless:
+                    raise ValueError("--frame_source viewport requires non-headless Isaac Sim.")
+                viewport = _setup_viewport_camera(cam_eye, cam_target)
+                frame_path = Path(tmp) / "viewport_frame.png"
+
+                print("[LOCAL REC] warming up viewport render pipeline ...", flush=True)
+                for _ in range(args.warmup_steps):
+                    mdp._world.step(render=True)
+
+                def get_frame():
+                    return _read_viewport_frame(
+                        mdp,
+                        viewport,
+                        frame_path,
+                        args.width,
+                        args.height,
+                        args.viewport_capture_wait_frames,
+                    )
+            else:
+                rec_annot, _rec_rp = _setup_offscreen_camera(
+                    args.width, args.height, cam_eye, cam_target
+                )
+
+                import omni.replicator.core as rep
+
+                print("[LOCAL REC] warming up replicator render pipeline ...", flush=True)
+                for _ in range(args.warmup_steps):
+                    rep.orchestrator.step(rt_subframes=1)
+
+                def get_frame():
+                    return _get_frame(rec_annot, args.width, args.height)
+
+            with _force_world_step_render(mdp, enabled=not args.no_force_render_step):
+                done = _record_one_agent_local(mdp, agent, args, get_frame, out_dir, prefix)
     finally:
         mdp.stop()
 
