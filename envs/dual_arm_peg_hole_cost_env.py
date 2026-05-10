@@ -19,8 +19,10 @@ cost critic Q_C 承担，reward critic Q_R 只看任务进展。这使得 SAC vs
 
 Cost 信号
 ---------
-_create_info_dictionary() 返回 {"cost": collision_mask.float()}，其中
+cost() 返回 collision_mask.float()，其中
 collision_mask = physx_collision | sphere_proxy_collision（self._last_collision_mask）。
+_create_info_dictionary() 是框架 hook，仅做 {"cost": self.cost()} 的封装。
+子类覆写 cost() 即可修改 cost 逻辑，无需碰框架 hook。
 当前 USD 下 PhysX 自碰撞不触发，等价于纯 sphere-proxy 信号；未来若 PhysX 恢复，
 cost 会同时包含两种碰撞，行为自然正确。
 
@@ -102,15 +104,16 @@ class DualArmPegHoleCostEnv(DualArmPegHoleEnv):
         )
         return self._reward_scale * r
 
-    def _create_info_dictionary(self):
-        """每步返回 cost 信号，供 ConstrainedReplayMemory 和 SACLagrangian 使用.
+    def cost(self):
+        """每步 cost 信号：碰撞 → 1.0，否则 0.0.
 
-        cost = 1.0 当且仅当该 env 该步发生碰撞（PhysX 或 sphere-proxy），否则 0.0.
-        mushroom-rl VectorCore 会将返回 dict 写入 dataset.info.data，
-        与 reward 在时间和 env 索引上对齐。
+        与 reward() 对称，是子类覆写 cost 逻辑的入口。
+        碰撞信号来自 self._last_collision_mask（PhysX | sphere-proxy）。
         """
         if self._last_collision_mask is None:
-            cost = torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
-        else:
-            cost = self._last_collision_mask.float()
-        return {"cost": cost}
+            return torch.zeros(self._n_envs, dtype=torch.float32, device=self._device)
+        return self._last_collision_mask.float()
+
+    def _create_info_dictionary(self, obs):
+        # 框架 hook：将 cost 信号注入 dataset.info，供 Lagrangian SAC 的 replay buffer 读取
+        return {"cost": self.cost()}
