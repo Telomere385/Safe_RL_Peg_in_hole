@@ -38,18 +38,23 @@ axis_gate_radius: 0.40
 terminal_hold_bonus: 0.0
 hold_success_steps: 10
 
-# Sphere-proxy 兜底: clearance_hard=0.0 = 球壳一接触即触发 hard absorbing.
-# 与 PhysX 力检测 OR, 补偿 PhysX 在 1-5cm 近距离的失明区.
+# Sphere-proxy 自碰撞兜底 (PhysX 1-5cm 失明区补丁, 全 stage 通用):
+#   clearance_hard=0.0 = 球壳一接触即触发 hard absorbing (与 PhysX 力检测 OR).
+#   proxy_arm_radius: iiwa link 段球半径 0.06m (link 直径 ~6-10cm, 带 margin).
+#   proxy_ee_radius:  coupler + hande_link 段球半径 0.04m (更紧凑但也更宽).
 # 关闭请设 clearance_hard: -.inf (注意负数会走 --clearance_hard=-.inf 形式).
 clearance_hard: 0.0
+proxy_arm_radius: 0.06
+proxy_ee_radius: 0.04
 
 # Warm-start controls.
 # 运行前确认此文件存在, 或传 --load_agent 覆盖:
 #   cp results/best_hold.msh results/S1_axisresid_home_uniform_repro_best_hold.msh
-load_agent: results/S1_axisresid_home_uniform_repro_best_hold.msh
+load_agent: results/checkpoints/2026-05-10/10-06-17/best_agent.msh
 actor_only_warmstart: true
 keep_replay: false
 
 wandb_project: bimanual_peghole
-wandb_run_name: phase2_axis05_gate040_cwarm50k_actoronly_200epochs
+wandb_entity: safe_rl_2026_lund
+wandb_run_name: SAC_phase2_seed42
 no_wandb: false
