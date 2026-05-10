@@ -607,3 +607,133 @@ cp results/final_agent_lag.msh results/<run_name>_final.msh
 ```bash
 --load_agent results/<lag_ckpt>.msh --actor_only_warmstart
 ```
+
+---
+
+## Stage 1 训练
+
+### 训练命令 (Hydra, 冷启动)
+
+```bash
+python scripts/train_hydra.py experiment@train=phase1_lagrangian
+```
+
+无需 SAC checkpoint，直接冷启动。`conf/experiment/phase1_lagrangian.yaml` 已包含所有超参，
+`--load_agent` 未设置即走 `_cold_create_sac_lag()`。
+
+完整超参见 `conf/experiment/phase1_lagrangian.yaml`，关键值：
+
+| 参数 | 值 | 备注 |
+|------|-----|------|
+| `lr_actor` | 1e-4 | 冷启动保守值 |
+| `alpha_max` | 0.05 | 防 entropy 项压制精度信号 |
+| `target_entropy` | -7 | = -act_dim/2, 冷启动 14-DoF |
+| `cost_limit` | 0.02 | TODO: 用 SAC baseline eval 标定 |
+| `lr_lambda` | 1e-3 | |
+| `lambda_max` | 100.0 | |
+| `init_log_lambda` | 0.0 | → λ_init = 1.0 |
+| `gamma_cost` | null (= env γ = 0.99) | |
+| `clearance_hard` | 0.0 | sphere-proxy 开启 |
+| `n_epochs` | 100 | |
+
+### λ 的作用与行为分析
+
+**λ 的作用：**
+
+Actor loss = `α·logπ − Q_R + λ·Q_C`
+
+λ 是 Lagrange 乘子，量化"当前约束有多紧"：
+- λ 大 → actor 被迫远离高 Q_C 的动作，主动压 cost
+- λ → 0 → actor loss 退化为纯 SAC，cost critic 对 actor 零影响
+
+λ 更新规则 (`lagrangian_sac.py:292`)：
+
+```
+log_λ += lr_λ × violation
+violation = Q_C × (1 − γ_c) − cost_limit
+```
+
+violation > 0（超预算）→ λ 上升；violation < 0（有余量）→ λ 下降。
+
+**λ 为何衰减至下限（4.5e-5 = e^{-10}）：**
+
+冷启动时分两个阶段：
+
+- **epoch 1–4（Q_C 低估期）**：cost critic 未收敛，Q_C ≈ 0，导致 `Q_C×(1-γ_c) < cost_limit`，
+  violation 看起来为负 → λ 持续下降。此时 eval 实测 cost_rate 已超标（epoch 3: 0.030，
+  epoch 4: 0.038），但 λ 更新用的是 replay buffer 中的 Q_C 估计，冷启动阶段低估导致 λ 反常下降。
+
+- **epoch 5+ （约束真正满足期）**：policy 突然学会到达 preinsert 区域（epoch 5: hold_rate=0.938），
+  真实 cost_rate 归零。violation 恒为 `-cost_limit = -0.02`，λ 持续下降直到触碰
+  lower clamp `log_λ = -10`（`lagrangian_sac.py:300`），停在 λ ≈ 4.5e-5。
+
+**λ ≈ 0 的影响：**
+
+训练从 epoch 5 起等价于标准 SAC，Lagrangian 约束机制完全休眠：
+
+```
+actor loss ≈ α·logπ − Q_R + 4.5e-5 · Q_C  ≈  α·logπ − Q_R
+```
+
+**是否需要 debug：** 否，λ 行为是正确的数学结果（约束满足、cost_limit 有余量则 λ
+应下降）。崩溃（epoch 16/20）发生时 λ 已为 0，与 Lagrangian 机制无关。
+
+**真实崩溃原因：** UTD=16 配合小 replay buffer（epoch 10 时仅约 20K transitions）
+导致 Q 值过估计，actor 梯度爆炸。标准 SAC policy collapse，不是 Lagrangian 问题。
+
+**冷启动 Q_C 低估的缓解方法（供参考）：**
+- 增大 `--critic_warmup_transitions`（如 50K），让 cost critic 先收敛再放开 λ 更新
+- `init_log_lambda` 不要设太高（当前 0.0 = λ_init=1.0 已属于偏高，容易被早期负 violation 快速压下）
+
+### 实验记录 (run-20260510_120554-7bkfr82a, 2026-05-10, 训练中)
+
+seed=42，冷启动，100 epoch（log 已记录至 epoch 56，训练仍在进行）。
+
+**训练曲线概述：**
+
+| epoch 区间 | J 范围 | hold_rate | cost_rate | λ | 事件 |
+|---|---:|---:|---:|---:|---|
+| 1–4 | -26.9 → -8.2 | 0–0.125 | 0.016–0.038 | 0.36→0.017 | 学习初期，cost_rate 超标但 Q_C 低估，λ 反常下降 |
+| 5–10 | 4.8 → 112.0 | 0.938→1.000 | 0.000 | 0.006→≈0 | policy 突破，hold_rate 跳至 1.0，λ 降至下限 |
+| 11–15 | 86.6 → 110.9 | 1.000 | 0.000 | ≈4.5e-5 | 平台期，max_hold_mean 稳定在 96–133 步 |
+| 16 | **−22.0** | 0.250 | 0.000 | ≈4.5e-5 | **第一次 policy collapse**（UTD=16 + 小 replay buffer Q 过估） |
+| 17–19 | 18.2 → 76.6 | 0.938→1.000 | 0.000 | ≈4.5e-5 | 部分恢复 |
+| 20–21 | **−54.7 → −51.8** | 0.000 | 0.000 | ≈4.5e-5 | **第二次 policy collapse，更严重** |
+| 22–32 | 2.1 → 107.4 | 0.750→1.000 | 0.000–0.005 | ≈4.5e-5 | 完全恢复，逐步爬回平台 |
+| 33–44 | 115.8 → **117.7** | 1.000 | 0.000 | ≈4.5e-5 | **超越崩溃前 peak**，epoch 44 创新高 best_J=117.67 |
+| 45–56 | 109.6 → 116.3 | 1.000 | 0.000 | ≈4.5e-5 | 稳定平台期（进行中） |
+
+**关键指标（截至 epoch 56）：**
+
+| 指标 | 值 | epoch |
+|------|-----|-------|
+| best_J | **117.67** | **44** |
+| best_hold_rate | 1.000 | 8 |
+| best_hold_max_hold_mean | **136.5 步** | **44** |
+| cost_rate @ peak | 0.000 | — |
+| λ @ peak | ≈4.5e-5 | — |
+| 第一次崩溃 | J=−22.0 | 16 |
+| 第二次崩溃 | J=−54.7 | 20 |
+| 超越崩溃前 peak | epoch 33（J=115.8 > 前 peak 112.0）| 33 |
+
+**checkpoint 位置：**
+
+```text
+results/checkpoints_lag/2026-05-10/12-02-15/best_agent.msh   # best_J=117.67, epoch 44 (持续更新)
+results/checkpoints_lag/2026-05-10/12-02-15/best_hold.msh    # best hold_rate=1.0
+results/checkpoints_lag/2026-05-10/12-02-15/final_agent.msh  # 训练结束后写入
+```
+
+**结论与注意事项：**
+
+- cost_rate 从 epoch 5 起持续为 0，满足 `cost_limit=0.02` 的安全约束
+- λ 降至 lower bound（≈4.5e-5），Lagrangian 机制从 epoch 5 起等价于纯 SAC
+- policy collapse 出现两次（epoch 16/20），但**均完全恢复，且 epoch 33 起超越崩溃前 peak**——与 SAC Phase 1 不同，这里 replay buffer 中的 bad transitions 被稀释后 policy 重新收敛
+- 部署选 `best_agent.msh`（当前 epoch 44，训练结束后可能继续更新），不要用 `final_agent.msh`
+- 可视化命令：
+
+```bash
+python scripts/train_hydra.py --multirun experiment@train=record_checkpoint \
+    train.checkpoint_dir=results/checkpoints_lag/2026-05-10/12-02-15 \
+    train.tag=lag_phase1
+```
