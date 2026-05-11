@@ -58,8 +58,8 @@ def parse_args():
                    help="两次 fit 之间收集的总 env-step 数 (默认 = num_envs, 即 1 个 vector-step)")
     p.add_argument("--utd", type=int, default=None,
                    help="每次 fit 块对应的总梯度步数. 默认自动取 n_steps_per_fit, 使 true UTD≈1")
-    p.add_argument("--lr_actor", type=float, default=3e-4,
-                   help="cold-start 联合任务推荐降到 1e-4 (避免 noisy critic 拉坏 actor),"
+    p.add_argument("--lr_actor", type=float, default=1e-4,
+                   help="cold-start 联合任务推荐降到 5e-5 (避免 noisy critic 拉坏 actor),"
                         "warm-start 用 default 即可.")
     p.add_argument("--lr_critic", type=float, default=3e-4)
     p.add_argument("--lr_alpha", type=float, default=3e-4)

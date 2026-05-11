@@ -16,9 +16,12 @@ Warmstart 注意:
 Cost signal 调标:
 - env 的 cost = sphere proxy collision indicator (0/1). PhysX 在当前 USD 上
   不触发 (见 dual_arm_peg_hole_env.py is_absorbing).
-- 设 --cost_limit 之前先用 SAC baseline 跑一次 64-ep eval, 记录
+- per-step λ 模式: 设 --cost_limit 之前先用 SAC baseline 跑一次 64-ep eval, 记录
   absorb_sphere_per_epoch / n_steps_per_epoch (per-step 触发率), 取其 0.5 倍
   做起步预算. 设 cost_limit=0 会让 λ 一上来就爆.
+- episode_rate λ 模式: cost_limit 是每集平均 cost sum; λ 只在完整 eval
+  episodes 后用 compute_cost_metrics()["cost_episode_sum_mean"] 更新, 不读取
+  replay random batch 或 Mushroom flattened dataset.last.
 
 整体架构：
   envs/dual_arm_peg_hole_cost_env.py   ← cost 信号来源 (DualArmPegHoleCostEnv)
@@ -33,6 +36,7 @@ Cost signal 调标:
 import argparse
 import math
 import sys
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -48,10 +52,175 @@ from scripts._eval_utils import (
     compute_cost_metrics,
     compute_hold_metrics,
     deterministic_policy,
-    parse_home_weights,
     resolve_eval_episode_count,
 )
 
+
+# ── Rollout episode cost tracking (used by rollout_episode_rate mode) ─────────
+#
+# Problem being solved:
+#   VectorCore.callback_step(samples) receives (s, a, r, s', absorbing, last, ...)
+#   per vector-step, but NOT step_info (which carries the cost tensor). Meanwhile,
+#   VectorizedDataset.flatten() corrupts the `last` flag by setting
+#   last_padded[-1, :] = True for the final vector-step of every fit chunk,
+#   making it impossible to count true episode boundaries from a flattened dataset.
+#
+# Solution: a thin env wrapper caches (cost, mask) into a shared bridge object
+# immediately after step_all() returns and before VectorCore fires callback_step.
+# The tracker callback reads from the bridge and accumulates per-env episode costs,
+# detecting episode ends from the raw `last` flag in samples (which is computed by
+# VectorCore as `absorbing | timeout` — the authoritative, pre-flatten signal).
+
+
+class StepCostBridge:
+    """Shared state between CostEnvWrapper and EpisodeCostTracker.
+
+    CostEnvWrapper.step_all() writes here right after env.step_all() returns.
+    EpisodeCostTracker.__call__() reads here when VectorCore fires callback_step.
+    The two always run in the same thread, so no locking is needed.
+    """
+
+    def __init__(self):
+        self.cost = None   # [num_envs] float tensor, set each vector-step
+        self.mask = None   # [num_envs] bool tensor (which envs were active)
+
+
+class CostEnvWrapper:
+    """Thin wrapper around the environment that populates StepCostBridge.
+
+    Intercepts step_all() to cache the cost tensor and active-env mask before
+    returning. Everything else (info, number, reset_all, stop, render_all, ...)
+    is forwarded to the underlying env via __getattr__, so VectorCore sees a
+    fully transparent wrapper.
+
+    Why not modify VectorCore instead? VectorCore.callback_step() only receives
+    the samples tuple — step_info (containing cost) is consumed internally and
+    never passed to the callback. The wrapper + bridge pattern sidesteps this
+    without touching the Mushroom framework.
+    """
+
+    def __init__(self, env, bridge: StepCostBridge):
+        self._env = env
+        self._bridge = bridge
+
+    def step_all(self, mask, action):
+        next_state, rewards, absorbing, step_info = self._env.step_all(mask, action)
+        # Populate bridge BEFORE returning. VectorCore._step() calls step_all()
+        # and then immediately returns to _run(), which fires callback_step.
+        # By the time the callback reads the bridge, it already has the current step.
+        self._bridge.cost = step_info.get("cost", None)
+        self._bridge.mask = mask
+        return next_state, rewards, absorbing, step_info
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+
+class EpisodeCostTracker:
+    """Accumulates per-env episode cost sums from the training rollout.
+
+    Used as VectorCore.callback_step — called once per vector-step with:
+        samples = (state, action, reward, next_state, absorbing, last, ...)
+    where `last = absorbing | (episode_steps >= horizon)`. This is the raw,
+    per-env episode-end signal from VectorCore._step(), NOT the Mushroom-flattened
+    `last` (which sets last_padded[-1, :] = True for every fit chunk boundary,
+    corrupting episode count if read from a flattened dataset).
+
+    Lifecycle per training epoch
+    ────────────────────────────
+    1. reset_accum()      — called at epoch start; discards partial episode costs
+                            left over from the previous epoch's rollout boundary.
+    2. core.learn()       — tracker fires per vector-step; accumulates costs;
+                            pushes a completed episode's total cost to _completed
+                            whenever last[i] == True for an active env.
+    3. ready() + drain()  — after core.learn(): if ≥ min_episodes completed,
+                            drain() returns (mean_cost, n) and clears the buffer.
+    4. active = False     — before core.evaluate(): suppresses the tracker so that
+                            eval episodes (deterministic policy) don't enter the
+                            rollout cost buffer.
+    5. core.evaluate()    — tracker is a no-op; bridge may still be written by
+                            the env wrapper, but tracker ignores it.
+    6. active = True      — after eval: re-enable for next epoch.
+    """
+
+    def __init__(self, num_envs: int, bridge: StepCostBridge,
+                 min_episodes: int = 1, maxlen: int = 1000):
+        """
+        Args:
+            num_envs: number of parallel environments.
+            bridge: shared bridge object populated by CostEnvWrapper.
+            min_episodes: minimum completed episodes required before drain()
+                reports results (ready() returns False below this threshold).
+                Default 1: always update if any episode completed this epoch.
+            maxlen: rolling buffer capacity. If more episodes complete without a
+                drain() call (e.g., very short episodes), oldest entries are
+                dropped (deque semantics). Default 1000 is conservative.
+        """
+        self._bridge = bridge
+        self._num_envs = num_envs
+        self._min_episodes = min_episodes
+        # Per-env running total for the current episode.
+        # Persists across fit chunks within an epoch; cleared by reset_accum().
+        self._accum = torch.zeros(num_envs, dtype=torch.float32)
+        # Completed episode cost sums for the current epoch window.
+        self._completed: deque = deque(maxlen=maxlen)
+        # Flip to False during eval so eval episodes don't pollute the buffer.
+        self.active: bool = True
+
+    def __call__(self, samples):
+        """VectorCore callback_step interface — called after each vector-step."""
+        if not self.active:
+            return
+        if self._bridge.cost is None or self._bridge.mask is None:
+            return
+
+        _, _, _, _, _absorbing, last, _, _ = samples
+
+        cost = torch.as_tensor(self._bridge.cost, dtype=torch.float32).cpu()
+        mask = torch.as_tensor(self._bridge.mask, dtype=torch.bool).cpu()
+        last = torch.as_tensor(last, dtype=torch.bool).cpu()
+
+        for i in range(self._num_envs):
+            if not mask[i]:
+                # Env was inactive this step (already done, waiting to reset).
+                continue
+            self._accum[i] += cost[i]
+            if last[i]:
+                # True episode end: absorbing termination OR horizon timeout.
+                # Push the episode's cumulative cost and reset the slot.
+                self._completed.append(float(self._accum[i]))
+                self._accum[i] = 0.0
+
+    def reset_accum(self):
+        """Discard partial episode costs, preparing for a fresh epoch rollout.
+
+        Must be called at the start of each epoch (before core.learn()).
+        Without this, the tail of the previous epoch's unfinished episodes
+        would bleed into the first completed episode of the new epoch.
+        """
+        self._accum.zero_()
+
+    def ready(self) -> bool:
+        """True if enough episodes have completed to justify a λ update."""
+        return len(self._completed) >= self._min_episodes
+
+    def drain(self):
+        """Return (mean_episode_cost, n_episodes) and clear the completed buffer.
+
+        Returns (nan, 0) if the buffer is empty (shouldn't happen after ready()).
+        """
+        if not self._completed:
+            return float("nan"), 0
+        costs = list(self._completed)
+        self._completed.clear()
+        return float(np.mean(costs)), len(costs)
+
+    @property
+    def n_episodes(self) -> int:
+        return len(self._completed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 INITIAL_REPLAY_SIZE = 10_000
 MAX_REPLAY_SIZE = 500_000
@@ -85,39 +254,75 @@ def parse_args():
                         "让 SAC 倾向稍集中, alpha 不顶 cap.")
     p.add_argument("--critic_warmup_transitions", type=int, default=None,
                    help="actor / α / λ 开始更新前需要的 replay 容量 (env-steps). 默认 = "
-                        "INITIAL_REPLAY_SIZE (10K). **actor-only warmstart 推荐设大** "
-                        "(e.g. 50000 ≈ 40 epoch), 让冷启动的 reward critic 和 cost critic "
-                        "先单独把 Q 学到合理量级, 再放开 actor 和 λ 更新. 必须 >= INITIAL_REPLAY_SIZE.")
+                        "INITIAL_REPLAY_SIZE (10K). actor-only warmstart 场景建议 "
+                        "10240~15360 (约 5~10 epoch): critic 需要少量预热, 但时间太长会导致 "
+                        "actor 解冻时梯度爆炸. 避免设 50000+. 必须 >= INITIAL_REPLAY_SIZE.")
     p.add_argument("--n_eval_episodes", type=int, default=None,
                    help="评估 episode 数. 默认自动取 num_envs, 并要求能被 num_envs 整除")
 
     # ---- Lagrangian 专属 ----------------------------------------------------
     p.add_argument("--cost_limit", type=float, required=True,
-                   help="per-step cost 预算 (e.g. 0.01 = 容忍 1% collision rate). "
-                        "标定方法见文件头.")
+                   help="cost 预算. per-step 模式下是每步 collision rate "
+                        "(e.g. 0.01 = 容忍 1% collision rate); "
+                        "episode_rate 下是每集平均碰撞次数. 标定方法见文件头.")
     p.add_argument("--lr_lambda", type=float, default=1e-3,
                    help="Lagrange 乘子学习率. 1e-3~1e-4, 通常比 lr_actor 低.")
     p.add_argument("--lambda_max", type=float, default=100.0,
                    help="λ clamp 上限. λ 冲到几百会把 actor 锁死.")
+    p.add_argument("--lambda_min", type=float, default=0.0,
+                   help="λ clamp 下限 (默认 0 = 不限). warmstart 场景建议 0.05~0.1, "
+                        "防止 cost=0 时 λ 指数衰减到零后安全信号完全消失.")
     p.add_argument("--init_log_lambda", type=float, default=0.0,
                    help="log_λ 初值, 默认 0 → λ_init=1.")
     p.add_argument("--gamma_cost", type=float, default=None,
                    help="cost MDP 折扣. 默认 = env γ. 设 1.0 = average-cost "
                         "(注意此时 cost_limit 直接是 Q_C 量纲, 不是 per-step).")
+    p.add_argument("--lambda_update_mode", type=str, default="max_recent_replay",
+                   choices=("max_recent_replay", "batch_cost_rate",
+                            "recent_cost_rate", "discounted_q",
+                            "episode_rate", "rollout_episode_rate"),
+                   help="λ 更新信号来源. "
+                        "rollout_episode_rate (推荐): cost_limit = 每集平均碰撞次数; "
+                        "使用当前 policy rollout 中完成的真实 episode cost 统计, "
+                        "在 core.learn() 结束后 drain EpisodeCostTracker 更新 λ; "
+                        "不读 replay/eval, 不依赖 Mushroom flattened last. "
+                        "episode_rate (eval-based, 有滞后): cost_limit = 每集平均碰撞次数; "
+                        "λ 只在 eval 后用 compute_cost_metrics()[cost_episode_sum_mean] 更新. "
+                        "max_recent_replay: fit() 中用最新采样块与 replay batch 的较大 "
+                        "per-step mean(cost). batch_cost_rate: 仅用 replay batch. "
+                        "recent_cost_rate: 仅用最新采样块. discounted_q: Q_C×(1-gamma_cost).")
+    p.add_argument("--min_lambda_update_episodes", type=int, default=None,
+                   help="rollout_episode_rate 模式: 触发 λ 更新所需的最少 episode 数. "
+                        "默认自动取 num_envs (一个完整 env 轮次). 若一个 epoch 内完成的 "
+                        "episode 数不足, 该 epoch 跳过 λ 更新, 下个 epoch 继续累积.")
+    p.add_argument("--actor_grad_clip", type=float, default=None,
+                   help="actor 参数梯度 L2 norm 上限. 默认不裁剪. warmstart 后 "
+                        "critic warmup 结束时第一次 actor 更新易梯度爆炸, 建议 1.0.")
     # ------------------------------------------------------------------------
 
-    # env 参数 (跟 train_sac.py 同)
+    # ---- env 参数 -----------------------------------------------------------
+    # Stage 2 reward（冷启动干净设计，无遗留补丁）
+    p.add_argument("--rew_pos", type=float, default=None,
+                   help="pos_err 惩罚系数. 默认 1.0.")
+    p.add_argument("--rew_axis", type=float, default=None,
+                   help="axis_err 惩罚系数. 默认 0.5 (axis_err∈[0,2], 折合满量程≈pos项).")
+    p.add_argument("--rew_axis_progress", type=float, default=None,
+                   help="轴对齐渐进正奖励系数. axis_progress=clamp(1-axis_err/2,0,1), "
+                        "越接近反向对齐越接近 1. 默认由 env/config 决定.")
+    p.add_argument("--rew_success", type=float, default=None,
+                   help="成功 per-step bonus. 默认 2.0.")
+    p.add_argument("--rew_action", type=float, default=None,
+                   help="动作 L2 正则系数. 默认 0.005.")
+    p.add_argument("--rew_home", type=float, default=None,
+                   help="Home 偏差正则系数 (均匀权重). 默认 0.001.")
+    # env 几何 / 物理
     p.add_argument("--initial_joint_noise", type=float, default=None)
     p.add_argument("--preinsert_success_pos_threshold", type=float, default=None)
     p.add_argument("--preinsert_offset", type=float, default=None)
-    p.add_argument("--rew_action", type=float, default=None)
-    p.add_argument("--rew_home", type=float, default=None)
-    p.add_argument("--home_weights", type=parse_home_weights, default=None)
-    p.add_argument("--rew_success", type=float, default=None)
-    p.add_argument("--rew_pos_success", type=float, default=None)
-    p.add_argument("--axis_gate_radius", type=float, default=None)
-    p.add_argument("--rew_axis", type=float, default=None)
     p.add_argument("--success_axis_threshold", type=float, default=None)
+    p.add_argument("--clearance_hard", type=float, default=None)
+    p.add_argument("--hold_success_steps", type=int, default=10,
+                   help="eval 指标: 连续 N 步在阈内算 hold success. 不影响训练 reward.")
 
     # warmstart
     p.add_argument("--load_agent", type=str, default=None,
@@ -128,11 +333,6 @@ def parse_args():
                    help="仅继承 actor (mu/sigma) 权重. SACLagrangian 从 SAC checkpoint "
                         "warmstart 必开此项. SACLagrangian → SACLagrangian 也建议开 "
                         "(reward 函数 / cost 信号若变, 旧 critic 语义错).")
-
-    # 终止信号
-    p.add_argument("--terminal_hold_bonus", type=float, default=None)
-    p.add_argument("--hold_success_steps", type=int, default=10)
-    p.add_argument("--clearance_hard", type=float, default=None)
     p.add_argument("--proxy_arm_radius", type=float, default=None)
     p.add_argument("--proxy_ee_radius", type=float, default=None)
     p.add_argument("--exclude_ee_from_physx_self_collision", action="store_true",
@@ -198,18 +398,25 @@ def main():
         raise ValueError(f"--cost_limit ({args.cost_limit}) 必须 >= 0")
     if args.cost_limit == 0.0:
         print("[WARN] --cost_limit=0 会让 λ 一上来就爆, 一般取 0.5×baseline collision rate.")
+    # Default: one full generation of parallel envs (each env completes ≥1 episode).
+    if args.min_lambda_update_episodes is None:
+        args.min_lambda_update_episodes = args.num_envs
     args.n_eval_episodes = resolve_eval_episode_count(
         args.n_eval_episodes, args.num_envs, "--n_eval_episodes"
     )
 
     from envs import DualArmPegHoleCostEnv
     env_kwargs = dict(num_envs=args.num_envs, headless=not args.render)
-    for key in ("initial_joint_noise", "preinsert_success_pos_threshold",
-                "preinsert_offset", "rew_action", "rew_success", "rew_pos_success",
-                "rew_axis", "rew_home", "home_weights", "axis_gate_radius",
-                "success_axis_threshold", "terminal_hold_bonus",
-                "clearance_hard", "proxy_arm_radius", "proxy_ee_radius"):
-        value = getattr(args, key)
+    for key in (
+        # Stage 2 reward
+        "rew_pos", "rew_axis", "rew_axis_progress",
+        "rew_success", "rew_action", "rew_home",
+        # 几何 / 物理
+        "initial_joint_noise", "preinsert_success_pos_threshold",
+        "preinsert_offset", "success_axis_threshold",
+        "clearance_hard", "proxy_arm_radius", "proxy_ee_radius",
+    ):
+        value = getattr(args, key, None)
         if value is not None:
             env_kwargs[key] = value
     if args.use_axis_resid_obs:
@@ -260,8 +467,11 @@ def main():
             cost_limit=args.cost_limit,
             lr_lambda=args.lr_lambda,
             lambda_max=args.lambda_max,
+            lambda_min=args.lambda_min,
             init_log_lambda=args.init_log_lambda,
             gamma_cost=args.gamma_cost,
+            lambda_update_mode=args.lambda_update_mode,
+            actor_grad_clip=args.actor_grad_clip,
         )
 
     if args.load_agent is not None:
@@ -304,7 +514,33 @@ def main():
         with torch.no_grad():
             agent._log_alpha.clamp_(max=math.log(args.alpha_max))
 
-    core = VectorCore(agent, mdp, callbacks_fit=[clamp_alpha])
+    # ── Rollout episode cost tracker setup ────────────────────────────────────
+    # rollout_episode_rate mode needs two extra pieces:
+    #   CostEnvWrapper  — intercepts mdp.step_all() to cache (cost, mask) into
+    #                     the bridge before VectorCore fires callback_step.
+    #   EpisodeCostTracker — used as callback_step; reads bridge; accumulates
+    #                     per-env episode cost sums; pushes to buffer on episode end.
+    # All other modes leave _tracker = None and use the real mdp directly.
+    if args.lambda_update_mode == "rollout_episode_rate":
+        _bridge = StepCostBridge()
+        _tracker = EpisodeCostTracker(
+            num_envs=args.num_envs,
+            bridge=_bridge,
+            min_episodes=args.min_lambda_update_episodes,
+        )
+        _env_for_core = CostEnvWrapper(mdp, _bridge)
+    else:
+        _bridge = None
+        _tracker = None
+        _env_for_core = mdp
+    # ──────────────────────────────────────────────────────────────────────────
+
+    core = VectorCore(
+        agent, _env_for_core,
+        callbacks_fit=[clamp_alpha],
+        # callback_step=None → VectorCore replaces it with a no-op lambda internally.
+        callback_step=_tracker,
+    )
 
     from datetime import datetime
     results_dir = PROJECT_ROOT / "results"
@@ -332,9 +568,10 @@ def main():
     )
     logger.info(f"preinsert_pos_th={mdp._preinsert_success_pos_threshold:.3f}m  "
                 f"axis_th={mdp._success_axis_threshold:.3f}  "
-                f"w_pos={mdp._w_pos:.3f}  w_axis={mdp._w_axis:.3f}  "
-                f"w_pos_success={mdp._w_pos_success:.3f}  "
-                f"w_success={mdp._w_success:.3f}")
+                f"w_pos={mdp._s2_w_pos:.3f}  w_axis={mdp._s2_w_axis:.3f}  "
+                f"w_axis_progress={mdp._s2_w_axis_progress:.3f}  "
+                f"w_success={mdp._s2_w_success:.3f}  "
+                f"w_action={mdp._s2_w_action:.4f}  w_home={mdp._s2_w_home:.4f}")
     if args.load_agent is not None:
         logger.info(f"warm-start: {args.load_agent}")
     logger.info(f"target_entropy={target_entropy:.3f}  "
@@ -342,10 +579,21 @@ def main():
                 f"lr_alpha={args.lr_alpha:.1e}  alpha_max={args.alpha_max:.3f}")
     gamma_cost_resolved = (args.gamma_cost if args.gamma_cost is not None
                            else mdp.info.gamma)
+    grad_clip_str = f"{args.actor_grad_clip:.2f}" if args.actor_grad_clip else "off"
     logger.info(f"[Lagrangian] cost_limit={args.cost_limit:.4f}  "
-                f"lr_lambda={args.lr_lambda:.1e}  lambda_max={args.lambda_max:.1f}  "
+                f"lr_lambda={args.lr_lambda:.1e}  "
+                f"lambda_max={args.lambda_max:.1f}  lambda_min={args.lambda_min:.4f}  "
                 f"init_log_lambda={args.init_log_lambda:.3f}  "
-                f"gamma_cost={gamma_cost_resolved:.3f}")
+                f"gamma_cost={gamma_cost_resolved:.3f}  "
+                f"lambda_update_mode={args.lambda_update_mode}  "
+                f"actor_grad_clip={grad_clip_str}")
+    if args.lambda_update_mode == "rollout_episode_rate":
+        logger.info(
+            f"[rollout_episode_rate] EpisodeCostTracker 已启用  "
+            f"min_lambda_update_episodes={args.min_lambda_update_episodes}  "
+            "λ 在每个 epoch 的 core.learn() 结束后由 drain() 更新; "
+            "eval 期间 tracker 暂停 (active=False) 避免 deterministic policy 数据污染."
+        )
     critic_only_steps = args.critic_warmup_transitions - INITIAL_REPLAY_SIZE
     if critic_only_steps > 0:
         critic_only_epochs = critic_only_steps / args.n_steps_per_epoch
@@ -416,6 +664,11 @@ def main():
     logger.info(f"填充 replay: {INITIAL_REPLAY_SIZE} env-steps "
                 f"(约 {warmup_vector_steps} vector-steps × {args.num_envs} envs)")
     core.learn(n_steps=INITIAL_REPLAY_SIZE, n_steps_per_fit=INITIAL_REPLAY_SIZE)
+    # Discard episodes accumulated during the initial replay fill.
+    # They were generated by the untrained policy and must not seed the first
+    # real λ update. Calling drain() without processing the result throws them away.
+    if _tracker is not None:
+        _tracker.drain()
 
     fits_per_epoch = args.n_steps_per_epoch // args.n_steps_per_fit
     vector_steps_per_fit = args.n_steps_per_fit / args.num_envs
@@ -438,6 +691,13 @@ def main():
     absorb_sphere_prev = mdp._absorb_count_sphere
 
     for epoch in range(args.n_epochs):
+        # Reset per-env cost accumulators so partial episodes from the previous
+        # epoch's rollout boundary don't bleed into this epoch's first completed
+        # episode. The deque of fully completed episodes is NOT cleared here —
+        # it persists only if ready() was False last epoch (uncommon).
+        if _tracker is not None:
+            _tracker.reset_accum()
+
         core.learn(
             n_steps=args.n_steps_per_epoch,
             n_steps_per_fit=args.n_steps_per_fit,
@@ -449,17 +709,56 @@ def main():
             clamp_alpha()
         total_env_steps += args.n_steps_per_epoch
 
+        # ── Rollout episode λ update (rollout_episode_rate mode) ──────────────
+        # After all fits for this epoch, drain the EpisodeCostTracker.
+        # drain() returns mean(episode_cost_sums) over episodes that completed
+        # during core.learn() this epoch — the on-policy, episode-normalized signal.
+        # This is the λ-update data stream: completed episode cost → rolling window
+        # → λ dual ascent. It runs from training rollout data, not eval.
+        #
+        # If fewer than min_lambda_update_episodes completed this epoch (e.g.,
+        # the horizon is long relative to n_steps_per_epoch), we skip the update
+        # and leave the buffer intact for accumulation into the next epoch.
+        _rollout_ep_mean = float("nan")
+        _rollout_n_ep = 0
+        if _tracker is not None:
+            if _tracker.ready():
+                _rollout_ep_mean, _rollout_n_ep = _tracker.drain()
+                agent.update_lambda_from_rollout_episodes(_rollout_ep_mean, _rollout_n_ep)
+            else:
+                # Report current buffer size without draining (accumulates to next epoch).
+                _rollout_n_ep = _tracker.n_episodes
+        # ──────────────────────────────────────────────────────────────────────
+
         absorb_epoch = mdp._absorb_count - absorb_prev
         absorb_physx_epoch = mdp._absorb_count_physx - absorb_physx_prev
         absorb_sphere_epoch = mdp._absorb_count_sphere - absorb_sphere_prev
 
+        # Disable tracker during eval: eval runs the deterministic policy, and
+        # those episode costs must NOT enter the rollout buffer (different policy,
+        # potentially different cost distribution, would bias λ's signal).
+        if _tracker is not None:
+            _tracker.active = False
         with deterministic_policy(agent):
             dataset = core.evaluate(n_episodes=args.n_eval_episodes, quiet=True)
+        # Re-enable tracker before next epoch's core.learn().
+        if _tracker is not None:
+            _tracker.active = True
+
         J = torch.mean(dataset.discounted_return).item()
         R = torch.mean(dataset.undiscounted_return).item()
         ep_len = len(dataset) / args.n_eval_episodes
         m = compute_hold_metrics(dataset, mdp, args.hold_success_steps)
         c = compute_cost_metrics(dataset, args.n_eval_episodes)
+        lambda_update_mode = getattr(agent, "_lambda_update_mode", args.lambda_update_mode)
+        # episode_rate: update λ from eval episodes (deterministic policy, one epoch lag).
+        # rollout_episode_rate: λ was already updated above from the rollout tracker;
+        #   do NOT call update_lambda_from_episode_statistics() here.
+        if lambda_update_mode == "episode_rate":
+            agent.update_lambda_from_episode_statistics(
+                cost_episode_rate=c["cost_episode_sum_mean"],
+                source="eval_episode_rate",
+            )
 
         improved_J = J > best_J
         if improved_J:
@@ -488,7 +787,27 @@ def main():
         absorb_sphere_prev = mdp._absorb_count_sphere
 
         lambda_val = float(agent._log_lambda.exp().item())
-        cost_violation = c['cost_rate'] - args.cost_limit
+        lambda_qc_mean = float(getattr(agent, "_lambda_qc_mean", float("nan")))
+        lambda_batch_cost_rate = float(
+            getattr(agent, "_lambda_batch_cost_rate", float("nan"))
+        )
+        lambda_recent_cost_rate = float(
+            getattr(agent, "_lambda_recent_cost_rate", float("nan"))
+        )
+        lambda_selected_cost_rate = float(
+            getattr(agent, "_lambda_selected_cost_rate", float("nan"))
+        )
+        lambda_internal_violation = float(
+            getattr(agent, "_lambda_internal_violation", float("nan"))
+        )
+        lambda_update_source = getattr(agent, "_lambda_update_source", "unknown")
+        # episode_rate / rollout_episode_rate: cost_limit is per-episode
+        # (collisions/episode); compare against the eval episode-sum metric.
+        # Per-step modes: cost_limit is a per-step rate; compare against eval per-step rate.
+        if lambda_update_mode in ("episode_rate", "rollout_episode_rate"):
+            cost_violation = c['cost_episode_sum_mean'] - args.cost_limit
+        else:
+            cost_violation = c['cost_rate'] - args.cost_limit
 
         logger.epoch_info(epoch + 1, J=J, R=R, best_J=best_J,
                           best_hold=best_hold_rate if best_hold_rate >= 0 else 0.0,
@@ -499,13 +818,30 @@ def main():
         logger.info("eval stats: "
                     f"hold_success_rate={m['hold_success_rate']:.3f}  "
                     f"max_hold_mean={m['max_hold_mean']:.1f}  "
+                    f"eval_ep_len={ep_len:.1f}  "
                     f"in_thresh_rate={m['in_thresh_rate']:.3f}  "
                     f"pos_success_rate={m['pos_success_rate']:.3f}  "
                     f"pos_err_mean={m['pos_err_mean']:.4f}m  "
                     f"axis_err_mean={m['axis_err_mean']:.4f}")
+        if m["pos_in_thresh_count"] > 0:
+            logger.info("  ↳ pos_in_thresh diagnostics: "
+                        f"count={m['pos_in_thresh_count']}  "
+                        f"axis_err_mean={m['axis_err_in_pos_thresh_mean']:.4f}  "
+                        f"axis_err_min={m['axis_err_in_pos_thresh_min']:.4f}")
+        else:
+            logger.info("  ↳ pos_in_thresh diagnostics: count=0  axis_err=n/a")
         logger.info(f"  ↳ cost_rate={c['cost_rate']:.4f}  "
                     f"cost_ep_sum={c['cost_episode_sum_mean']:.3f}  "
-                    f"violation={cost_violation:+.4f}  "
+                    f"eval_violation={cost_violation:+.4f}  "
+                    f"lambda_internal_violation={lambda_internal_violation:+.4f}  "
+                    f"lambda_selected_cost_rate={lambda_selected_cost_rate:.4f}  "
+                    f"lambda_recent_cost_rate={lambda_recent_cost_rate:.4f}  "
+                    f"lambda_batch_cost_rate={lambda_batch_cost_rate:.4f}  "
+                    f"lambda_qc_mean={lambda_qc_mean:.4f}  "
+                    f"rollout_ep_cost={_rollout_ep_mean:.3f}  "
+                    f"rollout_n_ep={_rollout_n_ep}  "
+                    f"lambda_update_mode={lambda_update_mode}  "
+                    f"lambda_update_source={lambda_update_source}  "
                     f"λ={lambda_val:.3f}  "
                     f"absorb_sphere={absorb_sphere_epoch}  "
                     f"absorb_physx={absorb_physx_epoch}")
@@ -524,10 +860,24 @@ def main():
                 "eval_pos_success_rate": m["pos_success_rate"],
                 "eval_pos_err_mean": m["pos_err_mean"],
                 "eval_axis_err_mean": m["axis_err_mean"],
+                "eval_pos_in_thresh_count": m["pos_in_thresh_count"],
+                "eval_axis_err_in_pos_thresh_mean": m["axis_err_in_pos_thresh_mean"],
+                "eval_axis_err_in_pos_thresh_min": m["axis_err_in_pos_thresh_min"],
                 "alpha": agent._alpha.item(),
                 # Lagrangian 专属
                 "lambda": lambda_val,
                 "log_lambda": float(agent._log_lambda.item()),
+                "lambda_qc_mean": lambda_qc_mean,
+                "lambda_batch_cost_rate": lambda_batch_cost_rate,
+                "lambda_recent_cost_rate": lambda_recent_cost_rate,
+                "lambda_selected_cost_rate": lambda_selected_cost_rate,
+                "lambda_internal_violation": lambda_internal_violation,
+                "lambda_update_mode": lambda_update_mode,
+                "lambda_update_source": lambda_update_source,
+                # rollout_episode_rate data stream: on-policy episode cost statistics
+                # used to drive λ. NaN in non-rollout_episode_rate modes.
+                "rollout_ep_cost_mean": _rollout_ep_mean,
+                "rollout_n_episodes": _rollout_n_ep,
                 "cost_rate": c["cost_rate"],
                 "cost_episode_sum_mean": c["cost_episode_sum_mean"],
                 "cost_violation": cost_violation,
